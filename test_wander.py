@@ -54,9 +54,9 @@ def test_baddie_hunts_and_kills():
     dead = set()
     baddies = [wander.Baddie(2, 2, 1, 0)]
     for _ in range(10):
-        events = wander.update_baddies(baddies, asterisks, dead, 20, 20, rng,
-                                       half_life=1e9)  # no decay
-        assert events == []
+        decayed, crowded = wander.update_baddies(baddies, asterisks, dead,
+                                                 20, 20, rng, half_life=1e9)
+        assert decayed == [] and crowded == []
     assert asterisks == set(), asterisks       # star was eaten ...
     assert (5, 5) in dead                       # ... and became an X
     # baddie stays in bounds
@@ -70,7 +70,7 @@ def test_baddie_wanders_when_no_prey():
     baddies = [wander.Baddie(10, 10, 1, 0)]
     for _ in range(50):
         wander.update_baddies(baddies, asterisks, dead, 20, 20, rng,
-                              half_life=1e9)  # no decay
+                              half_life=1e9)  # no decay, single baddie: no crowding
     assert asterisks == set() and dead == set()
     assert 1 <= baddies[0].x <= 20 and 1 <= baddies[0].y <= 20
 
@@ -81,11 +81,11 @@ def test_baddie_decays_into_gallery_form():
     asterisks = set()
     dead = set()
     baddies = [wander.Baddie(10, 10, 1, 0)]
-    events = wander.update_baddies(baddies, asterisks, dead, 30, 30, rng,
-                                   dt=1.0, half_life=1e-9)
+    decayed, crowded = wander.update_baddies(baddies, asterisks, dead, 30, 30,
+                                             rng, dt=1.0, half_life=1e-9)
     assert baddies == []                        # died ...
-    assert len(events) == 1                     # ... with one decay event
-    x, y, name = events[0]
+    assert len(decayed) == 1 and crowded == []  # ... with one decay event
+    x, y, name = decayed[0]
     assert (x, y) == (10, 10)                   # where it died
     assert name in [n for n, _ in wander.ALL_PATTERNS]
     assert len(asterisks) >= 1                  # form was stamped
@@ -98,9 +98,9 @@ def test_baddie_decay_clipped_at_board_edge():
     asterisks = set()
     dead = set()
     baddies = [wander.Baddie(1, 1, 1, 0)]       # corner: some offsets fall off-board
-    events = wander.update_baddies(baddies, asterisks, dead, 30, 30, rng,
-                                   dt=1.0, half_life=1e-9)
-    assert len(events) == 1
+    decayed, _ = wander.update_baddies(baddies, asterisks, dead, 30, 30, rng,
+                                       dt=1.0, half_life=1e-9)
+    assert len(decayed) == 1
     assert all(1 <= cx <= 30 and 1 <= cy <= 30 for cx, cy in asterisks)
 
 
@@ -108,9 +108,9 @@ def test_baddie_survives_when_half_life_is_long():
     rng = random.Random(3)
     baddies = [wander.Baddie(10, 10, 1, 0)]
     for _ in range(50):
-        events = wander.update_baddies(baddies, set(), set(), 20, 20, rng,
-                                       dt=0.2, half_life=1e9)
-        assert events == []
+        decayed, crowded = wander.update_baddies(baddies, set(), set(), 20, 20,
+                                                 rng, dt=0.2, half_life=1e9)
+        assert decayed == [] and crowded == []
     assert len(baddies) == 1
 
 
@@ -135,6 +135,44 @@ def test_baddie_glyph_matches_heading():
     assert wander.Baddie(1, 1, 0, -1).glyph() == "^"
     # zero heading is normalized (never a silent '.')
     assert wander.Baddie(1, 1, 0, 0).glyph() == ">"
+
+
+def test_baddies_self_destruct_when_crowded():
+    rng = random.Random(11)
+    asterisks = set()
+    dead = set()
+    baddies = [wander.Baddie(5, 5, 1, 0), wander.Baddie(6, 5, 1, 0)]  # adjacent
+    decayed, crowded = wander.update_baddies(baddies, asterisks, dead, 30, 30,
+                                             rng, half_life=1e9, crowd_radius=1)
+    assert decayed == []
+    assert sorted(crowded) == [(5, 5), (6, 5)]
+    assert baddies == []                         # both ended themselves ...
+    assert dead == {(5, 5), (6, 5)}              # ... leaving X corpses
+
+
+def test_baddies_chain_reaction_clears_cluster():
+    rng = random.Random(12)
+    baddies = [wander.Baddie(5, 5), wander.Baddie(6, 5), wander.Baddie(7, 5)]
+    decayed, crowded = wander.update_baddies(baddies, set(), set(), 30, 30,
+                                             rng, half_life=1e9, crowd_radius=1)
+    assert len(crowded) == 3 and baddies == []
+
+
+def test_baddies_survive_when_spread_out():
+    rng = random.Random(13)
+    baddies = [wander.Baddie(2, 2), wander.Baddie(18, 18)]
+    decayed, crowded = wander.update_baddies(baddies, set(), set(), 30, 30,
+                                             rng, half_life=1e9, crowd_radius=1)
+    assert crowded == [] and len(baddies) == 2
+
+
+def test_seed_board_places_mixed_forms():
+    rng = random.Random(5)
+    asterisks = set()
+    wander.seed_board(asterisks, 60, 40, rng, count=7)
+    # every seedable form has >= 3 cells; allow slack for rare overlaps
+    assert len(asterisks) >= 14
+    assert all(1 <= x <= 60 and 1 <= y <= 40 for x, y in asterisks)
 
 
 def test_save_load_roundtrip():

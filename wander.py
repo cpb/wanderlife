@@ -16,10 +16,16 @@ Life cycle:
   stand on baddie   + X      -> back to X
   stand on * or X   + X      -> erased / reclaimed
 
-Baddies are frozen solid in setup mode (no movement, no decay). In run
-mode they hunt -- and they are radioactive: each has a half-life of
-BADDIE_HALF_LIFE seconds, and on decay it is reborn as a random form
-from the gallery, stamped where it died.
+Baddies are frozen solid in setup mode, and can be stopped at any time
+with R3 (or the menu). In run mode they hunt -- and they are radioactive:
+each has a half-life of BADDIE_HALF_LIFE seconds, and on decay it is
+reborn as a random form from the gallery, stamped where it died. Baddies
+that find themselves too close to another baddie end themselves, leaving
+an X corpse.
+
+Other tricks:
+  double-tap X -> clear the whole board
+  the board is seeded with a mix of oscillating and static gallery forms
 """
 import os
 os.environ["SDL_VIDEODRIVER"] = "dummy"
@@ -37,13 +43,17 @@ SAVE_PATH = os.path.expanduser("~/wander_save.json")
 
 # Gameplay tuning
 KILL_RADIUS = 1          # SQUARE kills a (2r+1)x(2r+1) patch of stars around @
-BADDIE_TICK = 0.18       # seconds between baddie moves
+BADDIE_TICK = 0.35       # seconds between baddie moves (higher = slower)
 BADDIE_HALF_LIFE = 20.0  # seconds; decayed baddies become random gallery forms
+BADDIE_CROWD_RADIUS = 1  # baddies this close to another baddie self-destruct
+DOUBLE_TAP_TIME = 0.4    # seconds; two X taps inside this window clear the board
+SEED_FORMS = 7           # forms scattered at startup / on "Seed new life"
 
 # PS3 button map (pygame / sixaxis)
 BTN_X, BTN_CIRCLE, BTN_TRIANGLE, BTN_SQUARE = 0, 1, 2, 3
 BTN_L1, BTN_R1, BTN_L2, BTN_R2 = 4, 5, 6, 7
 BTN_SELECT, BTN_START, BTN_PS = 8, 9, 10
+BTN_L3, BTN_R3 = 11, 12
 
 PATTERNS_OSCILLATORS = [
     ("Single Star", [(0, 0)]),
@@ -110,6 +120,27 @@ def kill_area(px, py, radius, asterisks, dead_cells, max_x, max_y):
     return killed
 
 
+def seed_board(asterisks, max_x, max_y, rng, count=SEED_FORMS):
+    """Scatter a mix of oscillating and static forms at random positions
+    (the lonely Single Star is excluded). Forms are placed fully inside
+    the board; overlaps are allowed -- they make interesting soups."""
+    forms = PATTERNS_OSCILLATORS[1:] + PATTERNS_STATIC
+    for _ in range(count):
+        _, offsets = forms[rng.randrange(len(forms))]
+        minx = min(o[0] for o in offsets)
+        maxx = max(o[0] for o in offsets)
+        miny = min(o[1] for o in offsets)
+        maxy = max(o[1] for o in offsets)
+        lo_x, hi_x = 1 - minx, max_x - maxx
+        lo_y, hi_y = 1 - miny, max_y - maxy
+        if lo_x > hi_x or lo_y > hi_y:
+            continue  # board too small for this form
+        ax = rng.randint(lo_x, hi_x)
+        ay = rng.randint(lo_y, hi_y)
+        for ox, oy in offsets:
+            asterisks.add((ax + ox, ay + oy))
+
+
 class Baddie:
     """An arrow that hunts living cells and turns them into dead cells."""
     __slots__ = ("x", "y", "dx", "dy")
@@ -132,10 +163,14 @@ class Baddie:
 
 
 def update_baddies(baddies, asterisks, dead_cells, max_x, max_y, rng=None,
-                   dt=0.2, half_life=20.0):
+                   dt=0.2, half_life=20.0, crowd_radius=1):
     """Advance every baddie one tick.
 
-    Baddies are radioactive: each tick a baddie decays with probability
+    Crowding: baddies that begin the tick within Chebyshev distance
+    `crowd_radius` of another baddie end themselves, leaving an X
+    corpse. Resolved simultaneously on the positions at tick entry.
+
+    Radioactive: each tick a surviving baddie decays with probability
     p = 1 - 0.5 ** (dt / half_life), an exponential lifetime with the
     requested half-life. A decaying baddie is reborn as a random form
     from the gallery, stamped where it died (dead cells stay
@@ -144,15 +179,34 @@ def update_baddies(baddies, asterisks, dead_cells, max_x, max_y, rng=None,
     Survivors hunt the nearest living cell; with no prey they wander.
     Any living cell a baddie occupies dies -> X.
 
-    Returns a list of (x, y, pattern_name) decay events.
+    Returns (decayed, crowded):
+      decayed = [(x, y, pattern_name), ...]  reborn as gallery forms
+      crowded = [(x, y), ...]                self-destructed, left an X
     """
     rng = rng or random
     decay_chance = 1.0 - 0.5 ** (dt / half_life) if half_life > 0 else 1.0
     decayed = []
+    crowded = []
     survivors = []
     occupied = {b.pos for b in baddies}
-    for b in baddies:
+
+    doomed = set()
+    if crowd_radius > 0:
+        for i in range(len(baddies)):
+            for j in range(i + 1, len(baddies)):
+                if (abs(baddies[i].x - baddies[j].x) <= crowd_radius
+                        and abs(baddies[i].y - baddies[j].y) <= crowd_radius):
+                    doomed.add(i)
+                    doomed.add(j)
+
+    for i, b in enumerate(baddies):
         occupied.discard(b.pos)
+
+        # Crowding suicide: too close to another baddie -> X corpse
+        if i in doomed:
+            dead_cells.add(b.pos)
+            crowded.append(b.pos)
+            continue
 
         # Half-life decay: reborn as a random gallery form
         if rng.random() < decay_chance:
@@ -213,7 +267,7 @@ def update_baddies(baddies, asterisks, dead_cells, max_x, max_y, rng=None,
             dead_cells.add(b.pos)
 
     baddies[:] = survivors
-    return decayed
+    return decayed, crowded
 
 
 def save_game(path, state):
@@ -424,18 +478,20 @@ def main(stdscr):
     px, py = sw // 2, sh // 2
 
     asterisks = set()
-    for _ in range(15):
-        asterisks.add((random.randint(2, max_x - 1), random.randint(2, max_y - 1)))
+    seed_board(asterisks, max_x, max_y, rng)
     dead_cells = set()
     baddies = []
+    baddies_stopped = False
 
     is_running = False
     pattern_idx = 0
     static_pattern_idx = 0
     active_category = "dynamic"
 
-    move_cd = act_cd = erase_cd = stamp_cd = cycle_cd = 0.0
+    move_cd = stamp_cd = cycle_cd = 0.0
     mode_cd = menu_cd = gol_cd = baddie_cd = 0.0
+    last_x_tap = 0.0
+    prev_x = prev_sq = False
     message, message_until = "", 0.0
 
     def flash(text, dur=2.2):
@@ -447,6 +503,13 @@ def main(stdscr):
         now = time.time()
         dx, dy = read_nav(controller)
 
+        # Edge-triggered buttons (one action per physical press)
+        x_now = pressed(controller, BTN_X)
+        sq_now = pressed(controller, BTN_SQUARE)
+        x_edge = x_now and not prev_x
+        sq_edge = sq_now and not prev_sq
+        prev_x, prev_sq = x_now, sq_now
+
         # ---- System menu: SELECT / START / PS ----
         if (pressed(controller, BTN_SELECT) or pressed(controller, BTN_START)
                 or pressed(controller, BTN_PS)) and now - menu_cd > 0.3:
@@ -456,7 +519,10 @@ def main(stdscr):
                      ("save", "Save game")]
             if os.path.exists(SAVE_PATH):
                 items.append(("load", "Load game"))
-            items += [("clear", "Clear board"),
+            items.append(("freeze",
+                          "Resume baddies" if baddies_stopped else "Stop baddies"))
+            items += [("seed", "Seed new life"),
+                      ("clear", "Clear board"),
                       ("quit", "Quit")]
             action = run_menu(stdscr, controller, sw, sh, "WANDER MENU", items)
 
@@ -478,6 +544,7 @@ def main(stdscr):
                         "version": 1,
                         "player": [px, py],
                         "is_running": is_running,
+                        "baddies_stopped": baddies_stopped,
                         "asterisks": sorted(list(p) for p in asterisks),
                         "dead_cells": sorted(list(p) for p in dead_cells),
                         "baddies": [{"pos": [b.x, b.y], "dir": [b.dx, b.dy]}
@@ -506,6 +573,7 @@ def main(stdscr):
                     px = min(max(int(st.get("player", [px, py])[0]), 1), max_x)
                     py = min(max(int(st.get("player", [px, py])[1]), 1), max_y)
                     is_running = bool(st.get("is_running", False))
+                    baddies_stopped = bool(st.get("baddies_stopped", False))
                     if st.get("category") in ("dynamic", "static"):
                         active_category = st["category"]
                     pattern_idx = int(st.get("pattern_idx", 0)) % len(PATTERNS_OSCILLATORS)
@@ -513,6 +581,12 @@ def main(stdscr):
                     flash(f"Loaded (saved {st.get('saved_at', '?')})")
                 except Exception as e:
                     flash(f"Load failed: {e}", 3.5)
+            elif action == "freeze":
+                baddies_stopped = not baddies_stopped
+                flash("Baddies stopped" if baddies_stopped else "Baddies unleashed")
+            elif action == "seed":
+                seed_board(asterisks, max_x, max_y, rng)
+                flash("Seeded new life")
             elif action == "clear":
                 asterisks.clear()
                 dead_cells.clear()
@@ -524,9 +598,14 @@ def main(stdscr):
             mode_cd = now
             is_running = not is_running
 
+        # ---- R3: stop / unleash baddies ----
+        if pressed(controller, BTN_R3) and now - mode_cd > 0.3:
+            mode_cd = now
+            baddies_stopped = not baddies_stopped
+            flash("Baddies stopped" if baddies_stopped else "Baddies unleashed")
+
         # ---- SQUARE: kill stars around @ / spawn baddie from adjacent X ----
-        if pressed(controller, BTN_SQUARE) and now - act_cd > 0.25:
-            act_cd = now
+        if sq_edge:
             killed = kill_area(px, py, KILL_RADIUS, asterisks, dead_cells, max_x, max_y)
             if killed:
                 flash(f"Slain {killed} star{'s' if killed > 1 else ''} -> X")
@@ -543,21 +622,28 @@ def main(stdscr):
                 else:
                     flash("Stand on * to kill it, or beside X to spawn a baddie", 2.8)
 
-        # ---- X button: erase star / reclaim X / neutralize baddie ----
-        if pressed(controller, BTN_X) and now - erase_cd > 0.25:
-            erase_cd = now
-            if (px, py) in asterisks:
-                asterisks.discard((px, py))
-                flash("Star erased")
-            elif (px, py) in dead_cells:
-                dead_cells.discard((px, py))
-                flash("Cell reclaimed")
+        # ---- X button: double-tap clears the board; single tap erases ----
+        if x_edge:
+            if now - last_x_tap < DOUBLE_TAP_TIME:
+                last_x_tap = 0.0
+                asterisks.clear()
+                dead_cells.clear()
+                baddies.clear()
+                flash("Board cleared (double-tap X)")
             else:
-                hit = next((i for i, b in enumerate(baddies) if b.pos == (px, py)), None)
-                if hit is not None:
-                    del baddies[hit]
-                    dead_cells.add((px, py))
-                    flash("Baddie neutralized -> X")
+                last_x_tap = now
+                if (px, py) in asterisks:
+                    asterisks.discard((px, py))
+                    flash("Star erased")
+                elif (px, py) in dead_cells:
+                    dead_cells.discard((px, py))
+                    flash("Cell reclaimed")
+                else:
+                    hit = next((i for i, b in enumerate(baddies) if b.pos == (px, py)), None)
+                    if hit is not None:
+                        del baddies[hit]
+                        dead_cells.add((px, py))
+                        flash("Baddie neutralized -> X")
 
         # ---- Cycle patterns (setup only) ----
         if not is_running and now - cycle_cd > 0.18:
@@ -607,17 +693,23 @@ def main(stdscr):
             asterisks = step_game_of_life(asterisks, max_x, max_y,
                                           blocked=dead_cells, player_pos=(px, py))
 
-        # ---- Baddies tick: frozen in setup mode (no movement, no decay) ----
+        # ---- Baddies tick: frozen in setup mode or when stopped (R3) ----
         if baddies and now - baddie_cd > BADDIE_TICK:
             baddie_cd = now
-            if is_running:
-                events = update_baddies(baddies, asterisks, dead_cells,
-                                        max_x, max_y, rng,
-                                        dt=BADDIE_TICK, half_life=BADDIE_HALF_LIFE)
-                if len(events) == 1:
-                    flash(f"Baddie decayed into {events[0][2]}")
-                elif events:
-                    flash(f"{len(events)} baddies decayed into new life")
+            if is_running and not baddies_stopped:
+                decayed, crowded = update_baddies(baddies, asterisks, dead_cells,
+                                                  max_x, max_y, rng,
+                                                  dt=BADDIE_TICK,
+                                                  half_life=BADDIE_HALF_LIFE,
+                                                  crowd_radius=BADDIE_CROWD_RADIUS)
+                if len(decayed) == 1:
+                    flash(f"Baddie decayed into {decayed[0][2]}")
+                elif decayed:
+                    flash(f"{len(decayed)} baddies decayed into new life")
+                if len(crowded) == 1:
+                    flash("Baddie self-destructed (too crowded)")
+                elif crowded:
+                    flash(f"{len(crowded)} baddies self-destructed (too crowded)")
 
         # ---- Render ----
         stdscr.erase()
@@ -627,19 +719,23 @@ def main(stdscr):
         stdscr.attroff(border_attr)
 
         if is_running:
-            head = "[ RUN ]  □:kill/spawn  ✕:erase  △:setup  SEL:menu"
+            head = "[ RUN ]  □:kill/spawn  ✕:erase (✕✕:clear)  R3:baddies  △:setup  SEL:menu"
         else:
-            head = "[ SETUP ]  □:kill/spawn  ○:stamp  ✕:erase  △:run  SEL:menu"
+            head = "[ SETUP ]  □:kill/spawn  ○:stamp  ✕:erase (✕✕:clear)  △:run  SEL:menu"
         safe_addstr(stdscr, 0, 4, f" {head} ", border_attr | curses.A_BOLD)
-        stats = f" *{len(asterisks)} X{len(dead_cells)} B{len(baddies)} ({px},{py}) "
+        bmark = "s" if baddies_stopped else ""
+        stats = f" *{len(asterisks)} X{len(dead_cells)} B{len(baddies)}{bmark} ({px},{py}) "
         safe_addstr(stdscr, 0, max(1, sw - len(stats) - 2), stats, border_attr)
 
         for cx, cy in dead_cells:
             safe_addch(stdscr, cy, cx, "X", curses.color_pair(5))
         for cx, cy in asterisks:
             safe_addch(stdscr, cy, cx, "*", curses.color_pair(2))
+        baddie_attr = (curses.color_pair(6) | curses.A_BOLD
+                       if is_running and not baddies_stopped
+                       else curses.color_pair(5))
         for b in baddies:
-            safe_addch(stdscr, b.y, b.x, b.glyph(), curses.color_pair(6) | curses.A_BOLD)
+            safe_addch(stdscr, b.y, b.x, b.glyph(), baddie_attr)
 
         if not is_running:
             for ox, oy in p_offsets:

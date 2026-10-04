@@ -17,21 +17,28 @@ python3 wander.py        # on the Pi, with the PS3 controller paired
 | `X`       | dead cell — **empty and unoccupiable** for the Game of Life: nothing is born there, nothing survives there, and patterns cannot be stamped onto it |
 | `> < ^ v` | **baddie** — spawned from a dead cell; in run mode it roams the grid hunting living cells and turning them into more dead cells |
 
+The board is seeded at startup with a mix of oscillating and static gallery
+forms (no lonely single stars); "Seed new life" in the menu adds more.
+
 ### The life cycle
 
 1. Stand near stars and press **SQUARE** → a `(2·KILL_RADIUS+1)²` patch of
    stars dies into `X`s (default 3×3).
 2. Stand **beside an `X`** and press **SQUARE** → the `X` rises as a baddie.
-3. Baddies are **frozen in setup mode** — they neither move nor decay until
-   the sim is running.
+3. Baddies are **frozen in setup mode**, and can be stopped at any time with
+   **R3** (or the menu) — frozen baddies draw red and neither move nor decay.
 4. Baddies are **radioactive**: each has a half-life of `BADDIE_HALF_LIFE`
    seconds (default 20). On decay a baddie is reborn as a **random form from
    the gallery**, stamped where it died — killers return to life.
-5. Stand on a baddie and press **X** → it drops back to a harmless `X`.
-6. Stand on a `*` or `X` and press **X** → erase / reclaim the cell.
+5. Baddies that find themselves **too close to another baddie** (within
+   `BADDIE_CROWD_RADIUS`, default: adjacent) end themselves, leaving an `X`
+   corpse. Keep your herd spread out.
+6. Stand on a baddie and press **X** → it drops back to a harmless `X`.
+7. Stand on a `*` or `X` and press **X** → erase / reclaim the cell.
+8. **Double-tap X** → clear the whole board.
 
 Tuning knobs live at the top of `wander.py`: `KILL_RADIUS`, `BADDIE_TICK`,
-`BADDIE_HALF_LIFE`.
+`BADDIE_HALF_LIFE`, `BADDIE_CROWD_RADIUS`, `DOUBLE_TAP_TIME`, `SEED_FORMS`.
 
 ## Controls
 
@@ -39,12 +46,13 @@ Tuning knobs live at the top of `wander.py`: `KILL_RADIUS`, `BADDIE_TICK`,
 |-------------------|--------|
 | D-Pad / left stick | Move `@` · navigate menus |
 | □ SQUARE          | Kill stars in a patch around `@` → `X`s · beside `X`: spawn baddie |
-| ✕ CROSS           | Erase `*` · reclaim `X` · neutralize baddie → `X` |
+| ✕ CROSS           | Erase `*` · reclaim `X` · neutralize baddie → `X` · **double-tap: clear board** |
 | ○ CIRCLE          | Stamp the active pattern (setup mode) |
 | △ TRIANGLE        | Toggle setup ↔ run mode |
 | L1 / R1           | Cycle oscillator patterns (setup) |
 | L2 / R2           | Cycle static patterns (setup) |
-| SELECT or START   | Open the **menu**: Resume · Gallery · Save game · Load game · Clear board · Quit |
+| R3 (right stick)  | Stop / unleash the baddies |
+| SELECT or START   | Open the **menu**: Resume · Gallery · Save game · Load game · Stop/Resume baddies · Seed new life · Clear board · Quit |
 
 In run mode the Game of Life ticks and `@` participates as a living cell.
 
