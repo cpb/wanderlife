@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """wander.py -- Conway's Game of Life playground for PS3 controller + curses.
 
+Standalone single-player build. All game logic lives in wander_game.py;
+for the persistent multi-world server see wander_server.py, and for the
+networked client see wander_client.py.
+
 You are '@':
 
   *        living cell
@@ -41,258 +45,20 @@ from datetime import datetime
 
 import pygame
 
-SAVE_PATH = os.path.expanduser("~/wander_save.json")
+from wander_game import (ALL_PATTERNS, BADDIE_CROWD_RADIUS, BADDIE_HALF_LIFE,
+                         BADDIE_TICK, DOUBLE_TAP_TIME, GOL_TICK,
+                         KILL_RADIUS, MAX_KILL_RADIUS, PATTERNS_OSCILLATORS,
+                         PATTERNS_STATIC, SEED_FORMS, Baddie,
+                         baddies_to_gliders, kill_area, seed_board,
+                         step_game_of_life, update_baddies)
 
-# Gameplay tuning
-KILL_RADIUS = 1          # SQUARE kills a (2r+1)x(2r+1) patch of stars around @
-MAX_KILL_RADIUS = 5      # cap for runtime growth via L2/R2 in run mode
-BADDIE_TICK = 0.35       # seconds between baddie moves (higher = slower)
-BADDIE_HALF_LIFE = 20.0  # seconds; decayed baddies become random gallery forms
-BADDIE_CROWD_RADIUS = 1  # baddies this close to another baddie self-destruct
-DOUBLE_TAP_TIME = 0.4    # seconds; two X taps inside this window clear the board
-SEED_FORMS = 7           # forms scattered at startup / on "Seed new life"
+SAVE_PATH = os.path.expanduser("~/wander_save.json")
 
 # PS3 button map (pygame / sixaxis)
 BTN_X, BTN_CIRCLE, BTN_TRIANGLE, BTN_SQUARE = 0, 1, 2, 3
 BTN_L1, BTN_R1, BTN_L2, BTN_R2 = 4, 5, 6, 7
 BTN_SELECT, BTN_START, BTN_PS = 8, 9, 10
 BTN_L3, BTN_R3 = 11, 12
-
-PATTERNS_OSCILLATORS = [
-    ("Single Star", [(0, 0)]),
-    ("Glider", [(0, 0), (1, 1), (2, -1), (2, 0), (2, 1)]),
-    ("Blinker", [(-1, 0), (0, 0), (1, 0)]),
-    ("Toad", [(-1, 0), (0, 0), (1, 0), (0, 1), (1, 1), (2, 1)]),
-    ("Beacon", [(-1, -1), (0, -1), (-1, 0), (0, 0), (1, 1), (2, 1), (1, 2), (2, 2)])
-]
-
-PATTERNS_STATIC = [
-    ("Block", [(0, 0), (1, 0), (0, 1), (1, 1)]),
-    ("Beehive", [(0, 0), (1, 0), (-1, 1), (2, 1), (0, 2), (1, 2)]),
-    ("Loaf", [(0, 0), (1, 0), (-1, 1), (2, 1), (0, 2), (2, 2), (1, 3)]),
-    ("Boat", [(0, 0), (1, 0), (0, 1), (2, 1), (1, 2)]),
-    ("Tub", [(0, 0), (-1, 1), (1, 1), (0, 2)])
-]
-
-ALL_PATTERNS = PATTERNS_OSCILLATORS + PATTERNS_STATIC
-
-GLIDER_OFFSETS = dict(ALL_PATTERNS)["Glider"]
-
-
-# ---------------------------------------------------------------- Game logic
-
-def step_game_of_life(asterisks, max_x, max_y, blocked=frozenset(), player_pos=None):
-    """One Conway tick. `blocked` cells are unoccupiable: no births and no
-    survivals there. player_pos counts as a living cell for the tick."""
-    active_cells = set(asterisks)
-    if player_pos:
-        active_cells.add(player_pos)
-
-    neighbor_counts = {}
-    for (x, y) in active_cells:
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                if dx == 0 and dy == 0:
-                    continue
-                nx, ny = x + dx, y + dy
-                if 1 <= nx <= max_x and 1 <= ny <= max_y:
-                    neighbor_counts[(nx, ny)] = neighbor_counts.get((nx, ny), 0) + 1
-
-    next_asterisks = set()
-    for pos in active_cells:
-        if neighbor_counts.get(pos, 0) in (2, 3) and pos not in blocked:
-            next_asterisks.add(pos)
-
-    for pos, count in neighbor_counts.items():
-        if count == 3 and pos not in blocked:
-            next_asterisks.add(pos)
-
-    next_asterisks.difference_update(blocked)
-    next_asterisks.discard(player_pos)
-    return next_asterisks
-
-
-def kill_area(px, py, radius, asterisks, dead_cells, max_x, max_y):
-    """Turn every living cell within Chebyshev distance `radius` of (px, py)
-    into a dead cell (X). Returns the number of stars killed."""
-    killed = 0
-    for y in range(py - radius, py + radius + 1):
-        for x in range(px - radius, px + radius + 1):
-            if 1 <= x <= max_x and 1 <= y <= max_y and (x, y) in asterisks:
-                asterisks.discard((x, y))
-                dead_cells.add((x, y))
-                killed += 1
-    return killed
-
-
-def baddies_to_gliders(px, py, radius, baddies, asterisks, dead_cells,
-                       max_x, max_y):
-    """Turn every baddie within Chebyshev distance `radius` of (px, py) into
-    a glider stamped where it stood (dead cells stay unoccupiable; the
-    board edge clips). Returns the number converted."""
-    converted = 0
-    survivors = []
-    for b in baddies:
-        if abs(b.x - px) <= radius and abs(b.y - py) <= radius:
-            for ox, oy in GLIDER_OFFSETS:
-                t = (b.x + ox, b.y + oy)
-                if 1 <= t[0] <= max_x and 1 <= t[1] <= max_y and t not in dead_cells:
-                    asterisks.add(t)
-            converted += 1
-        else:
-            survivors.append(b)
-    baddies[:] = survivors
-    return converted
-
-
-def seed_board(asterisks, max_x, max_y, rng, count=SEED_FORMS):
-    """Scatter a mix of oscillating and static forms at random positions
-    (the lonely Single Star is excluded). Forms are placed fully inside
-    the board; overlaps are allowed -- they make interesting soups."""
-    forms = PATTERNS_OSCILLATORS[1:] + PATTERNS_STATIC
-    for _ in range(count):
-        _, offsets = forms[rng.randrange(len(forms))]
-        minx = min(o[0] for o in offsets)
-        maxx = max(o[0] for o in offsets)
-        miny = min(o[1] for o in offsets)
-        maxy = max(o[1] for o in offsets)
-        lo_x, hi_x = 1 - minx, max_x - maxx
-        lo_y, hi_y = 1 - miny, max_y - maxy
-        if lo_x > hi_x or lo_y > hi_y:
-            continue  # board too small for this form
-        ax = rng.randint(lo_x, hi_x)
-        ay = rng.randint(lo_y, hi_y)
-        for ox, oy in offsets:
-            asterisks.add((ax + ox, ay + oy))
-
-
-class Baddie:
-    """An arrow that hunts living cells and turns them into dead cells."""
-    __slots__ = ("x", "y", "dx", "dy")
-
-    def __init__(self, x, y, dx=1, dy=0):
-        self.x, self.y = x, y
-        if dx == 0 and dy == 0:
-            dx = 1
-        self.dx, self.dy = dx, dy
-
-    @property
-    def pos(self):
-        return (self.x, self.y)
-
-    def glyph(self):
-        """Arrow pointing along the current heading."""
-        if abs(self.dx) >= abs(self.dy):
-            return ">" if self.dx > 0 else "<"
-        return "v" if self.dy > 0 else "^"
-
-
-def update_baddies(baddies, asterisks, dead_cells, max_x, max_y, rng=None,
-                   dt=0.2, half_life=20.0, crowd_radius=1):
-    """Advance every baddie one tick.
-
-    Crowding: baddies that begin the tick within Chebyshev distance
-    `crowd_radius` of another baddie end themselves, leaving an X
-    corpse. Resolved simultaneously on the positions at tick entry.
-
-    Radioactive: each tick a surviving baddie decays with probability
-    p = 1 - 0.5 ** (dt / half_life), an exponential lifetime with the
-    requested half-life. A decaying baddie is reborn as a random form
-    from the gallery, stamped where it died (dead cells stay
-    unoccupiable; the board edge clips).
-
-    Survivors hunt the nearest living cell; with no prey they wander.
-    Any living cell a baddie occupies dies -> X.
-
-    Returns (decayed, crowded):
-      decayed = [(x, y, pattern_name), ...]  reborn as gallery forms
-      crowded = [(x, y), ...]                self-destructed, left an X
-    """
-    rng = rng or random
-    decay_chance = 1.0 - 0.5 ** (dt / half_life) if half_life > 0 else 1.0
-    decayed = []
-    crowded = []
-    survivors = []
-    occupied = {b.pos for b in baddies}
-
-    doomed = set()
-    if crowd_radius > 0:
-        for i in range(len(baddies)):
-            for j in range(i + 1, len(baddies)):
-                if (abs(baddies[i].x - baddies[j].x) <= crowd_radius
-                        and abs(baddies[i].y - baddies[j].y) <= crowd_radius):
-                    doomed.add(i)
-                    doomed.add(j)
-
-    for i, b in enumerate(baddies):
-        occupied.discard(b.pos)
-
-        # Crowding suicide: too close to another baddie -> X corpse
-        if i in doomed:
-            dead_cells.add(b.pos)
-            crowded.append(b.pos)
-            continue
-
-        # Half-life decay: reborn as a random gallery form
-        if rng.random() < decay_chance:
-            name, offsets = ALL_PATTERNS[rng.randrange(len(ALL_PATTERNS))]
-            for ox, oy in offsets:
-                t = (b.x + ox, b.y + oy)
-                if 1 <= t[0] <= max_x and 1 <= t[1] <= max_y and t not in dead_cells:
-                    asterisks.add(t)
-            decayed.append((b.x, b.y, name))
-            continue
-        survivors.append(b)
-
-        # Eat anything that appeared under us (e.g. a birth on our cell)
-        if b.pos in asterisks:
-            asterisks.discard(b.pos)
-            dead_cells.add(b.pos)
-
-        steps = []
-        if asterisks:
-            tx, ty = min(asterisks, key=lambda s: abs(s[0] - b.x) + abs(s[1] - b.y))
-            ox = (tx > b.x) - (tx < b.x)
-            oy = (ty > b.y) - (ty < b.y)
-            if ox and oy:
-                steps.append((ox, oy))
-            if abs(tx - b.x) >= abs(ty - b.y):
-                if ox:
-                    steps.append((ox, 0))
-                if oy:
-                    steps.append((0, oy))
-            else:
-                if oy:
-                    steps.append((0, oy))
-                if ox:
-                    steps.append((ox, 0))
-            if rng.random() < 0.2:
-                rng.shuffle(steps)  # jitter to break gridlock
-        if not steps:
-            if rng.random() < 0.35:
-                steps = [(rng.choice((-1, 0, 1)), rng.choice((-1, 0, 1)))]
-            else:
-                steps = [(b.dx, b.dy)]
-
-        for sx, sy in steps + [(0, 0)]:
-            nx, ny = b.x + sx, b.y + sy
-            if not (1 <= nx <= max_x and 1 <= ny <= max_y):
-                continue
-            if (nx, ny) in occupied:
-                continue
-            b.x, b.y = nx, ny
-            if sx or sy:
-                b.dx, b.dy = sx, sy
-            break
-        occupied.add(b.pos)
-
-        # Eat whatever we landed on
-        if b.pos in asterisks:
-            asterisks.discard(b.pos)
-            dead_cells.add(b.pos)
-
-    baddies[:] = survivors
-    return decayed, crowded
 
 
 def save_game(path, state):
@@ -739,7 +505,7 @@ def main(stdscr):
             py = max(1, min(max_y, py + dy))
 
         # ---- Game of Life tick (run mode; @ is a living cell) ----
-        if is_running and now - gol_cd > 0.4:
+        if is_running and now - gol_cd > GOL_TICK:
             gol_cd = now
             asterisks = step_game_of_life(asterisks, max_x, max_y,
                                           blocked=dead_cells, player_pos=(px, py))

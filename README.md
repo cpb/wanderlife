@@ -3,10 +3,43 @@
 Conway's Game of Life playground for a PS3 controller, built with pygame
 (controller input) + curses (terminal rendering). Runs on a Raspberry Pi.
 
-## Run
+## Pieces
+
+| File | Role |
+|------|------|
+| `wander_game.py` | shared game logic + `World` (pure python: no pygame, no curses) |
+| `wander_server.py` | headless game server: hosts persistent worlds over a UNIX socket, systemd-managed |
+| `wander_client.py` | PS3+curses client: opens at a world menu, plays attached worlds |
+| `wander.py` | standalone single-player build (no server needed) |
+| `wander.service` | systemd unit for the server |
+
+## Run (server mode)
+
+The server runs in the background via systemd:
 
 ```sh
-python3 wander.py        # on the Pi, with the PS3 controller paired
+sudo systemctl status wander     # is it up?
+sudo systemctl restart wander    # pick up a fresh deploy
+journalctl -u wander -f          # watch its log
+```
+
+Play with the client (PS3 controller paired):
+
+```sh
+python3 wander_client.py
+```
+
+The client opens at the **world menu**: open an existing world, create a
+new one (`X`), or delete one (**SQUARE twice**). Worlds live in
+`~/wander_worlds/*.json`, are saved every 30 s and on detach/shutdown, and
+**keep evolving in the background at 1/20 speed** (`BACKGROUND_SLOWDOWN`)
+while no client is attached — full speed while you're playing. One client
+per world at a time.
+
+## Run (standalone)
+
+```sh
+python3 wander.py        # classic single-player, saves to ~/wander_save.json
 ```
 
 ## You are `@`
@@ -67,8 +100,17 @@ Save files are written to `~/wander_save.json` on the Pi.
 ## Development
 
 ```sh
-python3 test_wander.py   # logic tests (no pygame needed, it is stubbed)
+python3 test_wander.py          # game-logic tests (pygame stubbed)
+python3 test_wander_server.py   # World + server protocol tests (pure python)
 ```
+
+### Client/server protocol
+
+Newline-delimited JSON over the UNIX socket `~/wander_server.sock`.
+Client: `list` / `create` / `delete` / `attach` / `detach` /
+`input` (move + button actions) / `command` (save, clear, seed,
+stop_baddies, set_pattern). Server replies `{"ok": ...}` and streams
+`{"type": "state", ...}` frames at 10 Hz to attached clients.
 
 ## Deployment
 
@@ -81,12 +123,15 @@ git push deploy main
 
 How it works:
 
-- The Pi has **no system git** (and no passwordless sudo), so a rootless git
-  is unpacked from the Raspbian `.deb` into `~/opt/git` (`apt-get download git`
-  + `dpkg -x`). `~/opt/git/receive-pack-wrapper.sh` sets `PATH`/`GIT_EXEC_PATH`
-  and is what the local repo invokes over SSH
+- The Pi has **no system git** (and originally no passwordless sudo), so a
+  rootless git is unpacked from the Raspbian `.deb` into `~/opt/git`
+  (`apt-get download git` + `dpkg -x`).
+  `~/opt/git/receive-pack-wrapper.sh` sets `PATH`/`GIT_EXEC_PATH` and is
+  what the local repo invokes over SSH
   (`git config remote.deploy.receivepack /home/cpb/opt/git/receive-pack-wrapper.sh`).
 - `~/wander.git` is a bare repo; its `hooks/post-receive` checks out `main`
   into `$HOME` (`git --work-tree=$HOME checkout -f main`) on every push.
 - The pre-git `wander.py` was backed up to `~/wander.py.bak.*` before the
   first deploy.
+- After pushing server changes, restart the service: `ssh 192.168.8.195
+  'sudo systemctl restart wander'`.
