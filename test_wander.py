@@ -128,6 +128,19 @@ def test_kill_area_turns_stars_to_x():
     assert n2 == 2 and asterisks2 == set() and dead2 == {(1, 1), (2, 1)}
 
 
+def test_kill_area_radius_zero_and_two():
+    # radius 0: only the cell under @
+    asterisks = {(5, 5), (6, 5)}
+    dead = set()
+    n = wander.kill_area(5, 5, 0, asterisks, dead, 20, 20)
+    assert n == 1 and asterisks == {(6, 5)} and dead == {(5, 5)}
+    # radius 2: a 5x5 patch
+    asterisks = {(5, 5), (7, 7), (8, 8)}
+    dead = set()
+    n = wander.kill_area(5, 5, 2, asterisks, dead, 20, 20)
+    assert n == 2 and asterisks == {(8, 8)} and dead == {(5, 5), (7, 7)}
+
+
 def test_baddie_glyph_matches_heading():
     assert wander.Baddie(1, 1, 1, 0).glyph() == ">"
     assert wander.Baddie(1, 1, -1, 0).glyph() == "<"
@@ -180,6 +193,8 @@ def test_save_load_roundtrip():
         "version": 1,
         "player": [3, 4],
         "is_running": True,
+        "baddies_stopped": True,
+        "kill_radius": 3,
         "asterisks": [[1, 2], [5, 6]],
         "dead_cells": [[2, 2]],
         "baddies": [{"pos": [7, 8], "dir": [-1, 0]}],

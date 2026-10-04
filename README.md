@@ -22,8 +22,11 @@ forms (no lonely single stars); "Seed new life" in the menu adds more.
 
 ### The life cycle
 
-1. Stand near stars and press **SQUARE** → a `(2·KILL_RADIUS+1)²` patch of
-   stars dies into `X`s (default 3×3).
+1. Stand near stars and press **SQUARE** → a `(2r+1)²` patch of stars dies
+   into `X`s. The radius `r` starts at `KILL_RADIUS` (default 1 → 3×3) and in
+   run mode you can **grow/shrink it live with R2/L2** (0 → 1×1, up to
+   `MAX_KILL_RADIUS` → 11×11). The kill zone is drawn as a dotted outline
+   around `@`, and shown in the HUD as `R<n>`.
 2. Stand **beside an `X`** and press **SQUARE** → the `X` rises as a baddie.
 3. Baddies are **frozen in setup mode**, and can be stopped at any time with
    **R3** (or the menu) — frozen baddies draw red and neither move nor decay.
@@ -37,8 +40,9 @@ forms (no lonely single stars); "Seed new life" in the menu adds more.
 7. Stand on a `*` or `X` and press **X** → erase / reclaim the cell.
 8. **Double-tap X** → clear the whole board.
 
-Tuning knobs live at the top of `wander.py`: `KILL_RADIUS`, `BADDIE_TICK`,
-`BADDIE_HALF_LIFE`, `BADDIE_CROWD_RADIUS`, `DOUBLE_TAP_TIME`, `SEED_FORMS`.
+Tuning knobs live at the top of `wander.py`: `KILL_RADIUS`, `MAX_KILL_RADIUS`,
+`BADDIE_TICK`, `BADDIE_HALF_LIFE`, `BADDIE_CROWD_RADIUS`, `DOUBLE_TAP_TIME`,
+`SEED_FORMS`.
 
 ## Controls
 
@@ -50,7 +54,7 @@ Tuning knobs live at the top of `wander.py`: `KILL_RADIUS`, `BADDIE_TICK`,
 | ○ CIRCLE          | Stamp the active pattern (setup mode) |
 | △ TRIANGLE        | Toggle setup ↔ run mode |
 | L1 / R1           | Cycle oscillator patterns (setup) |
-| L2 / R2           | Cycle static patterns (setup) |
+| L2 / R2           | Setup: cycle static patterns · **Run: shrink / grow @'s area of effect** |
 | R3 (right stick)  | Stop / unleash the baddies |
 | SELECT or START   | Open the **menu**: Resume · Gallery · Save game · Load game · Stop/Resume baddies · Seed new life · Clear board · Quit |
 

@@ -25,6 +25,7 @@ an X corpse.
 
 Other tricks:
   double-tap X -> clear the whole board
+  L2/R2 in run mode -> shrink / grow the @ area of effect (SQUARE)
   the board is seeded with a mix of oscillating and static gallery forms
 """
 import os
@@ -43,6 +44,7 @@ SAVE_PATH = os.path.expanduser("~/wander_save.json")
 
 # Gameplay tuning
 KILL_RADIUS = 1          # SQUARE kills a (2r+1)x(2r+1) patch of stars around @
+MAX_KILL_RADIUS = 5      # cap for runtime growth via L2/R2 in run mode
 BADDIE_TICK = 0.35       # seconds between baddie moves (higher = slower)
 BADDIE_HALF_LIFE = 20.0  # seconds; decayed baddies become random gallery forms
 BADDIE_CROWD_RADIUS = 1  # baddies this close to another baddie self-destruct
@@ -482,6 +484,7 @@ def main(stdscr):
     dead_cells = set()
     baddies = []
     baddies_stopped = False
+    kill_radius = KILL_RADIUS
 
     is_running = False
     pattern_idx = 0
@@ -545,6 +548,7 @@ def main(stdscr):
                         "player": [px, py],
                         "is_running": is_running,
                         "baddies_stopped": baddies_stopped,
+                        "kill_radius": kill_radius,
                         "asterisks": sorted(list(p) for p in asterisks),
                         "dead_cells": sorted(list(p) for p in dead_cells),
                         "baddies": [{"pos": [b.x, b.y], "dir": [b.dx, b.dy]}
@@ -574,6 +578,8 @@ def main(stdscr):
                     py = min(max(int(st.get("player", [px, py])[1]), 1), max_y)
                     is_running = bool(st.get("is_running", False))
                     baddies_stopped = bool(st.get("baddies_stopped", False))
+                    kill_radius = min(max(int(st.get("kill_radius", KILL_RADIUS)), 0),
+                                      MAX_KILL_RADIUS)
                     if st.get("category") in ("dynamic", "static"):
                         active_category = st["category"]
                     pattern_idx = int(st.get("pattern_idx", 0)) % len(PATTERNS_OSCILLATORS)
@@ -604,14 +610,15 @@ def main(stdscr):
             baddies_stopped = not baddies_stopped
             flash("Baddies stopped" if baddies_stopped else "Baddies unleashed")
 
-        # ---- SQUARE: kill stars around @ / spawn baddie from adjacent X ----
+        # ---- SQUARE: kill stars in the @ area / spawn baddie from a near X ----
         if sq_edge:
-            killed = kill_area(px, py, KILL_RADIUS, asterisks, dead_cells, max_x, max_y)
+            killed = kill_area(px, py, kill_radius, asterisks, dead_cells, max_x, max_y)
             if killed:
                 flash(f"Slain {killed} star{'s' if killed > 1 else ''} -> X")
             else:
+                sr = max(1, kill_radius)
                 near = [(px + ox, py + oy)
-                        for oy in (-1, 0, 1) for ox in (-1, 0, 1)
+                        for oy in range(-sr, sr + 1) for ox in range(-sr, sr + 1)
                         if (px + ox, py + oy) in dead_cells]
                 if near:
                     t = min(near, key=lambda c: abs(c[0] - px) + abs(c[1] - py))
@@ -663,6 +670,17 @@ def main(stdscr):
                 active_category = "static"
                 static_pattern_idx = (static_pattern_idx + 1) % len(PATTERNS_STATIC)
                 cycle_cd = now
+
+        # ---- L2/R2 in run mode: shrink / grow the @ area of effect ----
+        if is_running and now - cycle_cd > 0.18:
+            if pressed(controller, BTN_L2) and kill_radius > 0:
+                kill_radius -= 1
+                cycle_cd = now
+                flash(f"Kill area: {2 * kill_radius + 1}x{2 * kill_radius + 1}")
+            elif pressed(controller, BTN_R2) and kill_radius < MAX_KILL_RADIUS:
+                kill_radius += 1
+                cycle_cd = now
+                flash(f"Kill area: {2 * kill_radius + 1}x{2 * kill_radius + 1}")
 
         if active_category == "dynamic":
             p_name, p_offsets = PATTERNS_OSCILLATORS[pattern_idx]
@@ -719,13 +737,25 @@ def main(stdscr):
         stdscr.attroff(border_attr)
 
         if is_running:
-            head = "[ RUN ]  □:kill/spawn  ✕:erase (✕✕:clear)  R3:baddies  △:setup  SEL:menu"
+            head = "[ RUN ] □:kill ✕:erase(✕✕:clear) L2/R2:area R3:stop △:setup SEL:menu"
         else:
-            head = "[ SETUP ]  □:kill/spawn  ○:stamp  ✕:erase (✕✕:clear)  △:run  SEL:menu"
+            head = "[ SETUP ] □:kill/spawn ○:stamp ✕:erase(✕✕:clear) △:run SEL:menu"
         safe_addstr(stdscr, 0, 4, f" {head} ", border_attr | curses.A_BOLD)
         bmark = "s" if baddies_stopped else ""
-        stats = f" *{len(asterisks)} X{len(dead_cells)} B{len(baddies)}{bmark} ({px},{py}) "
+        stats = (f" *{len(asterisks)} X{len(dead_cells)} B{len(baddies)}{bmark}"
+                 f" R{kill_radius} ({px},{py}) ")
         safe_addstr(stdscr, 0, max(1, sw - len(stats) - 2), stats, border_attr)
+
+        # Area-of-effect outline: the SQUARE kill zone around @ (drawn first,
+        # so stars/X/baddies overwrite it -- dots remain only on empty cells)
+        if kill_radius > 0:
+            for oy in range(-kill_radius, kill_radius + 1):
+                for ox in range(-kill_radius, kill_radius + 1):
+                    if max(abs(ox), abs(oy)) != kill_radius:
+                        continue  # boundary ring only
+                    cx, cy = px + ox, py + oy
+                    if 1 <= cx <= max_x and 1 <= cy <= max_y:
+                        safe_addch(stdscr, cy, cx, ".", curses.A_DIM)
 
         for cx, cy in dead_cells:
             safe_addch(stdscr, cy, cx, "X", curses.color_pair(5))
