@@ -14,8 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import wander_game
 from wander_game import (BACKGROUND_SLOWDOWN, GOL_TICK, KILL_RADIUS,
-                         PATTERNS_STATIC, World)
-from wander_server import Server
+                         PATTERNS_STATIC, PROTOCOL_VERSION, World)
+from wander_server import Saver, Server
 
 
 # ------------------------------------------------------------------ World
@@ -122,6 +122,45 @@ def test_world_serialization_roundtrip():
 
 # --------------------------------------------------------- Server protocol
 
+def _client(sock_path):
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.settimeout(4.0)
+    c.connect(sock_path)
+    f = c.makefile("r", encoding="utf-8")
+
+    def call(obj):
+        obj.setdefault("v", PROTOCOL_VERSION)
+        c.sendall((json.dumps(obj) + "\n").encode())
+        while True:  # skip streaming frames; wait for the response
+            m = json.loads(f.readline())
+            if "ok" in m:
+                return m
+
+    def send(obj):
+        obj.setdefault("v", PROTOCOL_VERSION)
+        c.sendall((json.dumps(obj) + "\n").encode())
+
+    def wait_frame(pred, timeout=4.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            m = json.loads(f.readline())
+            if m.get("type") == "state" and pred(m):
+                return m
+        raise AssertionError("no matching frame")
+
+    return c, f, call, send, wait_frame
+
+
+def test_saver_writes_files_offthread():
+    with tempfile.TemporaryDirectory() as td:
+        s = Saver()
+        p = os.path.join(td, "w.json")
+        s.submit(p, {"a": 1})
+        s.flush()  # returns only when the write has landed
+        with open(p) as fh:
+            assert json.load(fh) == {"a": 1}
+
+
 def test_server_end_to_end():
     with tempfile.TemporaryDirectory() as td:
         sock_path = os.path.join(td, "test.sock")
@@ -135,76 +174,88 @@ def test_server_end_to_end():
                 time.sleep(0.02)
             assert os.path.exists(sock_path)
 
-            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            c.connect(sock_path)
-            f = c.makefile("r", encoding="utf-8")
+            c, f, call, send, wait_frame = _client(sock_path)
 
-            def call(obj):
-                c.sendall((json.dumps(obj) + "\n").encode())
-                while True:  # skip streaming frames; wait for the response
-                    m = json.loads(f.readline())
-                    if "ok" in m:
-                        return m
-
+            # every response carries the protocol version
             r = call({"cmd": "list"})
-            assert r["ok"] and r["worlds"] == []
+            assert r["ok"] and r["worlds"] == [] and r["v"] == PROTOCOL_VERSION
+
+            # protocol mismatch is rejected
+            bad = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            bad.settimeout(4.0)
+            bad.connect(sock_path)
+            bad.sendall(b'{"cmd": "list", "v": 999}\n')
+            bf = bad.makefile("r", encoding="utf-8")
+            m = json.loads(bf.readline())
+            assert not m["ok"] and "protocol" in m["error"]
+            bad.close()
 
             r = call({"cmd": "create", "name": "alpha", "max_x": 40, "max_y": 20})
             assert r["ok"] and r["name"] == "alpha"
-
-            r = call({"cmd": "create", "name": "alpha"})  # duplicate rejected
-            assert not r["ok"]
+            assert not call({"cmd": "create", "name": "alpha"})["ok"]  # dup
 
             r = call({"cmd": "attach", "name": "alpha"})
-            assert r["ok"] and r["state"]["name"] == "alpha"
+            assert r["ok"] and r["state"]["name"] == "alpha" and r["role"] == "play"
             assert len(r["state"]["asterisks"]) > 0
             px0 = r["state"]["px"]
 
-            # a second client cannot attach to the busy world
-            c2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            c2.connect(sock_path)
-            f2 = c2.makefile("r", encoding="utf-8")
-            c2.sendall((json.dumps({"cmd": "attach", "name": "alpha"}) + "\n").encode())
-            m2 = json.loads(f2.readline())
-            assert not m2["ok"] and "in use" in m2["error"]
+            # multiple clients CAN attach to the same world (v2 change)
+            c2, f2, call2, send2, wait_frame2 = _client(sock_path)
+            r2 = call2({"cmd": "attach", "name": "alpha", "role": "watch"})
+            assert r2["ok"] and r2["role"] == "watch"
 
-            # movement input is reflected in streamed state frames
-            c.sendall((json.dumps({"cmd": "input", "action": "move",
-                                   "dx": 1, "dy": 0}) + "\n").encode())
-            deadline = time.time() + 3
-            seen = None
-            while time.time() < deadline:
-                m = json.loads(f.readline())
-                if m.get("type") == "state":
-                    seen = m["state"]
-                    if seen["px"] == px0 + 1:
-                        break
-            assert seen and seen["px"] == px0 + 1
+            # world cannot be deleted while anyone is attached
+            assert not call({"cmd": "delete", "name": "alpha"})["ok"]
+
+            # first streamed frame for each client is a FULL frame
+            send({"cmd": "input", "action": "move", "dx": 1, "dy": 0})
+            m = wait_frame(lambda m: m.get("full") and m["state"]["px"] == px0 + 1)
+            assert m["v"] == PROTOCOL_VERSION
+            wait_frame2(lambda m: m.get("full"))
+
+            # second change arrives as a DELTA: px changed, asterisks omitted
+            send({"cmd": "input", "action": "move", "dx": 1, "dy": 0})
+            m = wait_frame(lambda m: not m.get("full") and "px" in m.get("delta", {}))
+            assert m["delta"]["px"] == px0 + 2
+            assert "asterisks" not in m["delta"]
+            # the watcher gets the same delta
+            m2 = wait_frame2(lambda m: not m.get("full") and "px" in m.get("delta", {}))
+            assert m2["delta"]["px"] == px0 + 2
+
+            # watcher inputs are ignored: c2 moves +5, then c1 moves +1
+            send2({"cmd": "input", "action": "move", "dx": 5, "dy": 0})
+            send({"cmd": "input", "action": "move", "dx": 1, "dy": 0})
+            m = wait_frame(lambda m: not m.get("full") and "px" in m.get("delta", {}))
+            assert m["delta"]["px"] == px0 + 3  # only the player's move
 
             # a world command reaches the world (clear empties the board)
-            c.sendall((json.dumps({"cmd": "command", "do": "clear"}) + "\n").encode())
-            deadline = time.time() + 3
-            while time.time() < deadline:
-                m = json.loads(f.readline())
-                if m.get("type") == "state" and not m["state"]["asterisks"]:
-                    break
-            else:
-                raise AssertionError("board never cleared")
+            send({"cmd": "command", "do": "clear"})
+            wait_frame(lambda m: not m.get("full")
+                       and m.get("delta", {}).get("asterisks") == [])
 
             r = call({"cmd": "detach"})
             assert r["ok"]
-            c2.sendall((json.dumps({"cmd": "detach"}) + "\n").encode())
+            r2 = call2({"cmd": "detach"})
+            assert r2["ok"]
+
+            # now deletable
+            assert call({"cmd": "delete", "name": "alpha"})["ok"]
+            assert call({"cmd": "list"})["worlds"] == []
+
+            # recreate + detach to leave a world on disk for the reload check
+            call({"cmd": "create", "name": "beta", "max_x": 33, "max_y": 21})
+            call({"cmd": "attach", "name": "beta"})
+            call({"cmd": "detach"})
             c.close()
             c2.close()
         finally:
             srv.stop = True
             th.join(timeout=5)
 
-        # world persisted to disk and reloads
-        with open(os.path.join(td, "alpha.json")) as fh:
+        # world persisted to disk (via the Saver thread) and reloads
+        with open(os.path.join(td, "beta.json")) as fh:
             w = World.from_dict(json.load(fh))
-        assert w.name == "alpha" and w.max_x == 40 and w.max_y == 20
-        assert not w.asterisks  # cleared above
+        assert w.name == "beta" and w.max_x == 33 and w.max_y == 21
 
 
 if __name__ == "__main__":

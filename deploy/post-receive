@@ -1,0 +1,29 @@
+#!/bin/sh
+# post-receive deploy hook for wander (installed at ~/wander.git/hooks/post-receive)
+# - checks out main into $HOME
+# - restarts the wander systemd service when game code changed
+#   (via the NOPASSWD sudoers rule in /etc/sudoers.d/wander)
+export PATH="$HOME/opt/git/root/usr/bin:$PATH"
+export GIT_EXEC_PATH="$HOME/opt/git/root/usr/lib/git-core"
+GITDIR="$HOME/wander.git"
+SYSTEMCTL="/usr/bin/systemctl"
+
+cd "$HOME"
+while read oldrev newrev refname; do
+    if [ "$refname" = "refs/heads/main" ]; then
+        echo "post-receive: deploying main -> $HOME"
+        git --git-dir="$GITDIR" --work-tree="$HOME" checkout -f main
+        echo "post-receive: now at $(git --git-dir="$GITDIR" log --oneline -1 main)"
+
+        if git --git-dir="$GITDIR" diff --name-only "$oldrev" "$newrev" \
+                | grep -qE 'wander(_game|_server|_client)?\.py$'; then
+            echo "post-receive: game code changed, restarting wander service"
+            if sudo -n "$SYSTEMCTL" restart wander 2>/dev/null; then
+                echo "post-receive: wander service restarted"
+            else
+                echo "post-receive: WARNING could not restart wander;"
+                echo "post-receive: run 'sudo systemctl restart wander' manually"
+            fi
+        fi
+    fi
+done

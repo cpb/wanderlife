@@ -23,18 +23,24 @@ sudo systemctl restart wander    # pick up a fresh deploy
 journalctl -u wander -f          # watch its log
 ```
 
-Play with the client (PS3 controller paired):
+Play with the client (PS3 controller paired, or keyboard):
 
 ```sh
 python3 wander_client.py
 ```
 
-The client opens at the **world menu**: open an existing world, create a
-new one (`X`), or delete one (**SQUARE twice**). Worlds live in
-`~/wander_worlds/*.json`, are saved every 30 s and on detach/shutdown, and
-**keep evolving in the background at 1/20 speed** (`BACKGROUND_SLOWDOWN`)
-while no client is attached — full speed while you're playing. One client
-per world at a time.
+The client opens at the **world menu**: play an existing world (`X`),
+watch one (`TRIANGLE` / `w`), create a new one, or delete one (**SQUARE
+twice**). **Multiple clients can attach to the same world** — `play`
+clients share the one `@` (chaos is a feature), `watch` clients are
+read-only. Worlds live in `~/wander_worlds/*.json`, are saved (dirty-only,
+on a background thread) every 30 s and on detach/shutdown, and **keep
+evolving in the background at 1/20 speed** (`BACKGROUND_SLOWDOWN`) while
+no client is attached — full speed while anyone is playing.
+
+Keyboard controls (when no controller is present): arrows/hjkl/wasd move,
+`SPACE`=SQUARE, `x`=X, `o`=CIRCLE, `t`=TRIANGLE, `[`/`]`=L1/R1,
+`-`/`=`=L2/R2, `b`=R3, `ESC`/`m`=menu, `ENTER`=confirm.
 
 ## Run (standalone)
 
@@ -104,13 +110,17 @@ python3 test_wander.py          # game-logic tests (pygame stubbed)
 python3 test_wander_server.py   # World + server protocol tests (pure python)
 ```
 
-### Client/server protocol
+### Client/server protocol (v2)
 
 Newline-delimited JSON over the UNIX socket `~/wander_server.sock`.
-Client: `list` / `create` / `delete` / `attach` / `detach` /
-`input` (move + button actions) / `command` (save, clear, seed,
-stop_baddies, set_pattern). Server replies `{"ok": ...}` and streams
-`{"type": "state", ...}` frames at 10 Hz to attached clients.
+Every message carries the protocol version (`"v": 2`); mismatches are
+rejected. Client: `list` / `create` / `delete` / `attach` (with
+`role: play|watch`) / `detach` / `input` (move + button actions) /
+`command` (save, clear, seed, stop_baddies, set_pattern). Server replies
+`{"ok": ...}` and streams frames at 10 Hz: the first frame is full
+state, later frames are **deltas** containing only changed fields
+(nothing is sent while the world is unchanged; a 5 s heartbeat proves
+liveness).
 
 ## Deployment
 
@@ -129,9 +139,12 @@ How it works:
   `~/opt/git/receive-pack-wrapper.sh` sets `PATH`/`GIT_EXEC_PATH` and is
   what the local repo invokes over SSH
   (`git config remote.deploy.receivepack /home/cpb/opt/git/receive-pack-wrapper.sh`).
-- `~/wander.git` is a bare repo; its `hooks/post-receive` checks out `main`
-  into `$HOME` (`git --work-tree=$HOME checkout -f main`) on every push.
+- `~/wander.git` is a bare repo; its `hooks/post-receive` (versioned in
+  this repo as `deploy/post-receive`) checks out `main` into `$HOME` on
+  every push and **restarts the wander service automatically when game
+  code changed**, via `sudo -n systemctl restart wander`.
+- `/etc/sudoers.d/wander` (versioned as `deploy/sudoers-wander`) grants
+  `cpb` NOPASSWD rights to *exactly* `systemctl restart wander` — nothing
+  else, and the password is not stored anywhere.
 - The pre-git `wander.py` was backed up to `~/wander.py.bak.*` before the
   first deploy.
-- After pushing server changes, restart the service: `ssh 192.168.8.195
-  'sudo systemctl restart wander'`.

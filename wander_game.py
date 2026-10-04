@@ -22,6 +22,8 @@ SEED_FORMS = 7           # forms scattered at startup / on "Seed new life"
 GOL_TICK = 0.4           # seconds between Game of Life steps when running
 BACKGROUND_SLOWDOWN = 20.0  # idle (clientless) worlds tick this many times slower
 
+PROTOCOL_VERSION = 2     # client/server protocol; bumped on breaking changes
+
 PATTERNS_OSCILLATORS = [
     ("Single Star", [(0, 0)]),
     ("Glider", [(0, 0), (1, 1), (2, -1), (2, 0), (2, 1)]),
@@ -291,12 +293,17 @@ class World:
         self.message_time = 0.0
         self.created = datetime.now().isoformat(timespec="seconds")
         self.tick_count = 0
+        self.rev = 0  # bumped on every mutation; servers send deltas per rev
         seed_board(self.asterisks, self.max_x, self.max_y, self.rng)
 
     # ------------------------------------------------------------ helpers
+    def _touch(self):
+        self.rev += 1
+
     def flash(self, text):
         self.last_message = text
         self.message_time = time.time()
+        self._touch()
 
     def current_pattern(self):
         if self.category == "dynamic":
@@ -315,10 +322,12 @@ class World:
                 self.asterisks = step_game_of_life(
                     self.asterisks, self.max_x, self.max_y,
                     blocked=self.dead_cells, player_pos=(self.px, self.py))
+                self._touch()
             if self.baddies and not self.baddies_stopped:
                 self.baddie_clock += dt
                 if self.baddie_clock >= BADDIE_TICK * scale:
                     self.baddie_clock = 0.0
+                    self._touch()
                     decayed, crowded = update_baddies(
                         self.baddies, self.asterisks, self.dead_cells,
                         self.max_x, self.max_y, self.rng, dt=BADDIE_TICK,
@@ -337,8 +346,15 @@ class World:
 
     # ------------------------------------------------------------ actions
     def move(self, dx, dy):
-        self.px = max(1, min(self.max_x, self.px + int(dx)))
-        self.py = max(1, min(self.max_y, self.py + int(dy)))
+        nx = max(1, min(self.max_x, self.px + int(dx)))
+        ny = max(1, min(self.max_y, self.py + int(dy)))
+        if (nx, ny) != (self.px, self.py):
+            self.px, self.py = nx, ny
+            self._touch()
+
+    def toggle_run(self):
+        self.is_running = not self.is_running
+        self._touch()
 
     def square(self):
         """Kill stars in the area, convert baddies to gliders, or -- when
@@ -396,9 +412,6 @@ class World:
                 del self.baddies[hit]
                 self.dead_cells.add(p)
                 self.flash("Baddie neutralized -> X")
-
-    def toggle_run(self):
-        self.is_running = not self.is_running
 
     def toggle_baddies(self):
         self.baddies_stopped = not self.baddies_stopped
@@ -567,4 +580,5 @@ class World:
         w.created = str(st.get("created",
                                datetime.now().isoformat(timespec="seconds")))
         w.tick_count = int(st.get("tick_count", 0))
+        w.rev = 0
         return w
