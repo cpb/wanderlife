@@ -11,10 +11,15 @@ You are '@':
            living cells and turning them into more dead cells.
 
 Life cycle:
-  stand on *        + SQUARE -> X
+  stand near stars  + SQUARE -> a patch of X (KILL_RADIUS area of effect)
   stand beside X    + SQUARE -> baddie
   stand on baddie   + X      -> back to X
   stand on * or X   + X      -> erased / reclaimed
+
+Baddies are frozen solid in setup mode (no movement, no decay). In run
+mode they hunt -- and they are radioactive: each has a half-life of
+BADDIE_HALF_LIFE seconds, and on decay it is reborn as a random form
+from the gallery, stamped where it died.
 """
 import os
 os.environ["SDL_VIDEODRIVER"] = "dummy"
@@ -29,6 +34,11 @@ from datetime import datetime
 import pygame
 
 SAVE_PATH = os.path.expanduser("~/wander_save.json")
+
+# Gameplay tuning
+KILL_RADIUS = 1          # SQUARE kills a (2r+1)x(2r+1) patch of stars around @
+BADDIE_TICK = 0.18       # seconds between baddie moves
+BADDIE_HALF_LIFE = 20.0  # seconds; decayed baddies become random gallery forms
 
 # PS3 button map (pygame / sixaxis)
 BTN_X, BTN_CIRCLE, BTN_TRIANGLE, BTN_SQUARE = 0, 1, 2, 3
@@ -87,6 +97,19 @@ def step_game_of_life(asterisks, max_x, max_y, blocked=frozenset(), player_pos=N
     return next_asterisks
 
 
+def kill_area(px, py, radius, asterisks, dead_cells, max_x, max_y):
+    """Turn every living cell within Chebyshev distance `radius` of (px, py)
+    into a dead cell (X). Returns the number of stars killed."""
+    killed = 0
+    for y in range(py - radius, py + radius + 1):
+        for x in range(px - radius, px + radius + 1):
+            if 1 <= x <= max_x and 1 <= y <= max_y and (x, y) in asterisks:
+                asterisks.discard((x, y))
+                dead_cells.add((x, y))
+                killed += 1
+    return killed
+
+
 class Baddie:
     """An arrow that hunts living cells and turns them into dead cells."""
     __slots__ = ("x", "y", "dx", "dy")
@@ -108,13 +131,39 @@ class Baddie:
         return "v" if self.dy > 0 else "^"
 
 
-def update_baddies(baddies, asterisks, dead_cells, max_x, max_y, rng=None):
-    """Move every baddie one cell. Baddies hunt the nearest living cell;
-    with no prey they wander. Any living cell they occupy dies -> X."""
+def update_baddies(baddies, asterisks, dead_cells, max_x, max_y, rng=None,
+                   dt=0.2, half_life=20.0):
+    """Advance every baddie one tick.
+
+    Baddies are radioactive: each tick a baddie decays with probability
+    p = 1 - 0.5 ** (dt / half_life), an exponential lifetime with the
+    requested half-life. A decaying baddie is reborn as a random form
+    from the gallery, stamped where it died (dead cells stay
+    unoccupiable; the board edge clips).
+
+    Survivors hunt the nearest living cell; with no prey they wander.
+    Any living cell a baddie occupies dies -> X.
+
+    Returns a list of (x, y, pattern_name) decay events.
+    """
     rng = rng or random
+    decay_chance = 1.0 - 0.5 ** (dt / half_life) if half_life > 0 else 1.0
+    decayed = []
+    survivors = []
     occupied = {b.pos for b in baddies}
     for b in baddies:
         occupied.discard(b.pos)
+
+        # Half-life decay: reborn as a random gallery form
+        if rng.random() < decay_chance:
+            name, offsets = ALL_PATTERNS[rng.randrange(len(ALL_PATTERNS))]
+            for ox, oy in offsets:
+                t = (b.x + ox, b.y + oy)
+                if 1 <= t[0] <= max_x and 1 <= t[1] <= max_y and t not in dead_cells:
+                    asterisks.add(t)
+            decayed.append((b.x, b.y, name))
+            continue
+        survivors.append(b)
 
         # Eat anything that appeared under us (e.g. a birth on our cell)
         if b.pos in asterisks:
@@ -162,6 +211,9 @@ def update_baddies(baddies, asterisks, dead_cells, max_x, max_y, rng=None):
         if b.pos in asterisks:
             asterisks.discard(b.pos)
             dead_cells.add(b.pos)
+
+    baddies[:] = survivors
+    return decayed
 
 
 def save_game(path, state):
@@ -472,13 +524,12 @@ def main(stdscr):
             mode_cd = now
             is_running = not is_running
 
-        # ---- SQUARE: kill star under @ / spawn baddie from adjacent X ----
+        # ---- SQUARE: kill stars around @ / spawn baddie from adjacent X ----
         if pressed(controller, BTN_SQUARE) and now - act_cd > 0.25:
             act_cd = now
-            if (px, py) in asterisks:
-                asterisks.discard((px, py))
-                dead_cells.add((px, py))
-                flash("Star slain -> X")
+            killed = kill_area(px, py, KILL_RADIUS, asterisks, dead_cells, max_x, max_y)
+            if killed:
+                flash(f"Slain {killed} star{'s' if killed > 1 else ''} -> X")
             else:
                 near = [(px + ox, py + oy)
                         for oy in (-1, 0, 1) for ox in (-1, 0, 1)
@@ -556,10 +607,17 @@ def main(stdscr):
             asterisks = step_game_of_life(asterisks, max_x, max_y,
                                           blocked=dead_cells, player_pos=(px, py))
 
-        # ---- Baddies tick (both modes) ----
-        if baddies and now - baddie_cd > 0.18:
+        # ---- Baddies tick: frozen in setup mode (no movement, no decay) ----
+        if baddies and now - baddie_cd > BADDIE_TICK:
             baddie_cd = now
-            update_baddies(baddies, asterisks, dead_cells, max_x, max_y, rng)
+            if is_running:
+                events = update_baddies(baddies, asterisks, dead_cells,
+                                        max_x, max_y, rng,
+                                        dt=BADDIE_TICK, half_life=BADDIE_HALF_LIFE)
+                if len(events) == 1:
+                    flash(f"Baddie decayed into {events[0][2]}")
+                elif events:
+                    flash(f"{len(events)} baddies decayed into new life")
 
         # ---- Render ----
         stdscr.erase()

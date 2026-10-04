@@ -15,22 +15,30 @@ python3 wander.py        # on the Pi, with the PS3 controller paired
 |-----------|---------|
 | `*`       | living cell |
 | `X`       | dead cell — **empty and unoccupiable** for the Game of Life: nothing is born there, nothing survives there, and patterns cannot be stamped onto it |
-| `> < ^ v` | **baddie** — spawned from a dead cell, roams the grid hunting living cells and turning them into more dead cells |
+| `> < ^ v` | **baddie** — spawned from a dead cell; in run mode it roams the grid hunting living cells and turning them into more dead cells |
 
 ### The life cycle
 
-1. Walk `@` onto a `*` and press **SQUARE** → the star dies, leaving an `X`.
-2. Stand **beside an `X`** and press **SQUARE** → the `X` rises as a baddie
-   and starts running around killing stars (making more `X`s for you).
-3. Stand on a baddie and press **X** → it drops back to a harmless `X`.
-4. Stand on a `*` or `X` and press **X** → erase / reclaim the cell.
+1. Stand near stars and press **SQUARE** → a `(2·KILL_RADIUS+1)²` patch of
+   stars dies into `X`s (default 3×3).
+2. Stand **beside an `X`** and press **SQUARE** → the `X` rises as a baddie.
+3. Baddies are **frozen in setup mode** — they neither move nor decay until
+   the sim is running.
+4. Baddies are **radioactive**: each has a half-life of `BADDIE_HALF_LIFE`
+   seconds (default 20). On decay a baddie is reborn as a **random form from
+   the gallery**, stamped where it died — killers return to life.
+5. Stand on a baddie and press **X** → it drops back to a harmless `X`.
+6. Stand on a `*` or `X` and press **X** → erase / reclaim the cell.
+
+Tuning knobs live at the top of `wander.py`: `KILL_RADIUS`, `BADDIE_TICK`,
+`BADDIE_HALF_LIFE`.
 
 ## Controls
 
 | Button            | Action |
 |-------------------|--------|
 | D-Pad / left stick | Move `@` · navigate menus |
-| □ SQUARE          | On `*`: kill it → `X` · beside `X`: spawn baddie |
+| □ SQUARE          | Kill stars in a patch around `@` → `X`s · beside `X`: spawn baddie |
 | ✕ CROSS           | Erase `*` · reclaim `X` · neutralize baddie → `X` |
 | ○ CIRCLE          | Stamp the active pattern (setup mode) |
 | △ TRIANGLE        | Toggle setup ↔ run mode |

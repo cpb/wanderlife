@@ -54,7 +54,9 @@ def test_baddie_hunts_and_kills():
     dead = set()
     baddies = [wander.Baddie(2, 2, 1, 0)]
     for _ in range(10):
-        wander.update_baddies(baddies, asterisks, dead, 20, 20, rng)
+        events = wander.update_baddies(baddies, asterisks, dead, 20, 20, rng,
+                                       half_life=1e9)  # no decay
+        assert events == []
     assert asterisks == set(), asterisks       # star was eaten ...
     assert (5, 5) in dead                       # ... and became an X
     # baddie stays in bounds
@@ -67,9 +69,63 @@ def test_baddie_wanders_when_no_prey():
     dead = set()
     baddies = [wander.Baddie(10, 10, 1, 0)]
     for _ in range(50):
-        wander.update_baddies(baddies, asterisks, dead, 20, 20, rng)
+        wander.update_baddies(baddies, asterisks, dead, 20, 20, rng,
+                              half_life=1e9)  # no decay
     assert asterisks == set() and dead == set()
     assert 1 <= baddies[0].x <= 20 and 1 <= baddies[0].y <= 20
+
+
+def test_baddie_decays_into_gallery_form():
+    # half-life ~ 0  =>  decay probability 1.0 on the first tick
+    rng = random.Random(1)
+    asterisks = set()
+    dead = set()
+    baddies = [wander.Baddie(10, 10, 1, 0)]
+    events = wander.update_baddies(baddies, asterisks, dead, 30, 30, rng,
+                                   dt=1.0, half_life=1e-9)
+    assert baddies == []                        # died ...
+    assert len(events) == 1                     # ... with one decay event
+    x, y, name = events[0]
+    assert (x, y) == (10, 10)                   # where it died
+    assert name in [n for n, _ in wander.ALL_PATTERNS]
+    assert len(asterisks) >= 1                  # form was stamped
+    assert all(1 <= cx <= 30 and 1 <= cy <= 30 for cx, cy in asterisks)
+    assert not (asterisks & dead)               # dead cells stay unoccupiable
+
+
+def test_baddie_decay_clipped_at_board_edge():
+    rng = random.Random(2)
+    asterisks = set()
+    dead = set()
+    baddies = [wander.Baddie(1, 1, 1, 0)]       # corner: some offsets fall off-board
+    events = wander.update_baddies(baddies, asterisks, dead, 30, 30, rng,
+                                   dt=1.0, half_life=1e-9)
+    assert len(events) == 1
+    assert all(1 <= cx <= 30 and 1 <= cy <= 30 for cx, cy in asterisks)
+
+
+def test_baddie_survives_when_half_life_is_long():
+    rng = random.Random(3)
+    baddies = [wander.Baddie(10, 10, 1, 0)]
+    for _ in range(50):
+        events = wander.update_baddies(baddies, set(), set(), 20, 20, rng,
+                                       dt=0.2, half_life=1e9)
+        assert events == []
+    assert len(baddies) == 1
+
+
+def test_kill_area_turns_stars_to_x():
+    asterisks = {(5, 5), (6, 5), (4, 4), (9, 9), (5, 8)}
+    dead = set()
+    n = wander.kill_area(5, 5, 1, asterisks, dead, 20, 20)
+    assert n == 3                               # the 3x3 patch around (5,5)
+    assert asterisks == {(9, 9), (5, 8)}        # outside the patch: untouched
+    assert dead == {(5, 5), (6, 5), (4, 4)}
+    # radius respects the board border without crashing
+    asterisks2 = {(1, 1), (2, 1)}
+    dead2 = set()
+    n2 = wander.kill_area(1, 1, 1, asterisks2, dead2, 20, 20)
+    assert n2 == 2 and asterisks2 == set() and dead2 == {(1, 1), (2, 1)}
 
 
 def test_baddie_glyph_matches_heading():
