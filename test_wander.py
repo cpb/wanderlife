@@ -179,6 +179,32 @@ def test_baddies_survive_when_spread_out():
     assert crowded == [] and len(baddies) == 2
 
 
+def test_kill_action_turns_baddies_into_gliders():
+    asterisks = set()
+    dead = set()
+    baddies = [wander.Baddie(10, 10, 1, 0), wander.Baddie(18, 18, 1, 0)]
+    n = wander.baddies_to_gliders(10, 10, 1, baddies, asterisks, dead, 30, 30)
+    assert n == 1                                # only the baddie in range
+    assert len(baddies) == 1 and baddies[0].pos == (18, 18)
+    glider = {(10 + ox, 10 + oy) for ox, oy in dict(wander.ALL_PATTERNS)["Glider"]}
+    assert asterisks == glider                   # stamped where it stood
+
+
+def test_baddie_glider_conversion_respects_blocked_and_bounds():
+    dead = {(10, 10)}                            # anchor cell is an X
+    baddies = [wander.Baddie(10, 10, 1, 0)]
+    asterisks = set()
+    n = wander.baddies_to_gliders(10, 10, 1, baddies, asterisks, dead, 30, 30)
+    assert n == 1
+    assert (10, 10) not in asterisks             # X stays unoccupiable ...
+    assert len(asterisks) == 4                   # ... glider loses that cell
+    # corner: off-board cells are clipped
+    baddies2 = [wander.Baddie(1, 1, 1, 0)]
+    asterisks2 = set()
+    wander.baddies_to_gliders(1, 1, 1, baddies2, asterisks2, set(), 30, 30)
+    assert all(1 <= x <= 30 and 1 <= y <= 30 for x, y in asterisks2)
+
+
 def test_seed_board_places_mixed_forms():
     rng = random.Random(5)
     asterisks = set()

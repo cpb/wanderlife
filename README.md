@@ -27,6 +27,8 @@ forms (no lonely single stars); "Seed new life" in the menu adds more.
    run mode you can **grow/shrink it live with R2/L2** (0 → 1×1, up to
    `MAX_KILL_RADIUS` → 11×11). The kill zone is drawn as a dotted outline
    around `@`, and shown in the HUD as `R<n>`.
+   **Baddies caught in the blast are turned into gliders**, stamped where
+   they stood — killers return to life, ready to fly.
 2. Stand **beside an `X`** and press **SQUARE** → the `X` rises as a baddie.
 3. Baddies are **frozen in setup mode**, and can be stopped at any time with
    **R3** (or the menu) — frozen baddies draw red and neither move nor decay.
@@ -49,7 +51,7 @@ Tuning knobs live at the top of `wander.py`: `KILL_RADIUS`, `MAX_KILL_RADIUS`,
 | Button            | Action |
 |-------------------|--------|
 | D-Pad / left stick | Move `@` · navigate menus |
-| □ SQUARE          | Kill stars in a patch around `@` → `X`s · beside `X`: spawn baddie |
+| □ SQUARE          | Kill stars in the patch around `@` → `X`s · baddies in the patch → gliders · beside `X`: spawn baddie |
 | ✕ CROSS           | Erase `*` · reclaim `X` · neutralize baddie → `X` · **double-tap: clear board** |
 | ○ CIRCLE          | Stamp the active pattern (setup mode) |
 | △ TRIANGLE        | Toggle setup ↔ run mode |

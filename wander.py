@@ -11,7 +11,8 @@ You are '@':
            living cells and turning them into more dead cells.
 
 Life cycle:
-  stand near stars  + SQUARE -> a patch of X (KILL_RADIUS area of effect)
+  stand near stars  + SQUARE -> a patch of X (area of effect: L2/R2 in run)
+  baddies caught in the SQUARE area are turned into gliders
   stand beside X    + SQUARE -> baddie
   stand on baddie   + X      -> back to X
   stand on * or X   + X      -> erased / reclaimed
@@ -75,6 +76,8 @@ PATTERNS_STATIC = [
 
 ALL_PATTERNS = PATTERNS_OSCILLATORS + PATTERNS_STATIC
 
+GLIDER_OFFSETS = dict(ALL_PATTERNS)["Glider"]
+
 
 # ---------------------------------------------------------------- Game logic
 
@@ -120,6 +123,26 @@ def kill_area(px, py, radius, asterisks, dead_cells, max_x, max_y):
                 dead_cells.add((x, y))
                 killed += 1
     return killed
+
+
+def baddies_to_gliders(px, py, radius, baddies, asterisks, dead_cells,
+                       max_x, max_y):
+    """Turn every baddie within Chebyshev distance `radius` of (px, py) into
+    a glider stamped where it stood (dead cells stay unoccupiable; the
+    board edge clips). Returns the number converted."""
+    converted = 0
+    survivors = []
+    for b in baddies:
+        if abs(b.x - px) <= radius and abs(b.y - py) <= radius:
+            for ox, oy in GLIDER_OFFSETS:
+                t = (b.x + ox, b.y + oy)
+                if 1 <= t[0] <= max_x and 1 <= t[1] <= max_y and t not in dead_cells:
+                    asterisks.add(t)
+            converted += 1
+        else:
+            survivors.append(b)
+    baddies[:] = survivors
+    return converted
 
 
 def seed_board(asterisks, max_x, max_y, rng, count=SEED_FORMS):
@@ -610,11 +633,21 @@ def main(stdscr):
             baddies_stopped = not baddies_stopped
             flash("Baddies stopped" if baddies_stopped else "Baddies unleashed")
 
-        # ---- SQUARE: kill stars in the @ area / spawn baddie from a near X ----
+        # ---- SQUARE: kill stars + convert baddies in the @ area ----
+        # ----        (or spawn a baddie from a near X)                ----
         if sq_edge:
-            killed = kill_area(px, py, kill_radius, asterisks, dead_cells, max_x, max_y)
-            if killed:
-                flash(f"Slain {killed} star{'s' if killed > 1 else ''} -> X")
+            killed = kill_area(px, py, kill_radius, asterisks, dead_cells,
+                               max_x, max_y)
+            converted = baddies_to_gliders(px, py, kill_radius, baddies,
+                                           asterisks, dead_cells, max_x, max_y)
+            if killed or converted:
+                parts = []
+                if killed:
+                    parts.append(f"{killed} star{'s' if killed > 1 else ''} -> X")
+                if converted:
+                    parts.append(f"{converted} baddie{'s' if converted > 1 else ''}"
+                                 f" -> glider{'s' if converted > 1 else ''}")
+                flash("; ".join(parts))
             else:
                 sr = max(1, kill_radius)
                 near = [(px + ox, py + oy)
