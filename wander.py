@@ -1,11 +1,39 @@
+#!/usr/bin/env python3
+"""wander.py -- Conway's Game of Life playground for PS3 controller + curses.
+
+You are '@':
+
+  *        living cell
+  X        dead cell -- for the Game of Life it is empty AND unoccupiable:
+           nothing is born there, nothing survives there, and patterns
+           cannot be stamped onto it.
+  > < ^ v  baddie -- spawned from a dead cell, roams the grid hunting
+           living cells and turning them into more dead cells.
+
+Life cycle:
+  stand on *        + SQUARE -> X
+  stand beside X    + SQUARE -> baddie
+  stand on baddie   + X      -> back to X
+  stand on * or X   + X      -> erased / reclaimed
+"""
 import os
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 os.environ["SDL_AUDIODRIVER"] = "dummy"
 
 import curses
+import json
 import random
 import time
+from datetime import datetime
+
 import pygame
+
+SAVE_PATH = os.path.expanduser("~/wander_save.json")
+
+# PS3 button map (pygame / sixaxis)
+BTN_X, BTN_CIRCLE, BTN_TRIANGLE, BTN_SQUARE = 0, 1, 2, 3
+BTN_L1, BTN_R1, BTN_L2, BTN_R2 = 4, 5, 6, 7
+BTN_SELECT, BTN_START, BTN_PS = 8, 9, 10
 
 PATTERNS_OSCILLATORS = [
     ("Single Star", [(0, 0)]),
@@ -25,16 +53,20 @@ PATTERNS_STATIC = [
 
 ALL_PATTERNS = PATTERNS_OSCILLATORS + PATTERNS_STATIC
 
-def step_game_of_life(asterisks, max_x, max_y, player_pos=None):
-    """Evolves Conway's Game of Life. Treats player_pos as an active living cell if provided."""
+
+# ---------------------------------------------------------------- Game logic
+
+def step_game_of_life(asterisks, max_x, max_y, blocked=frozenset(), player_pos=None):
+    """One Conway tick. `blocked` cells are unoccupiable: no births and no
+    survivals there. player_pos counts as a living cell for the tick."""
     active_cells = set(asterisks)
     if player_pos:
         active_cells.add(player_pos)
 
     neighbor_counts = {}
     for (x, y) in active_cells:
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
                 if dx == 0 and dy == 0:
                     continue
                 nx, ny = x + dx, y + dy
@@ -43,98 +75,269 @@ def step_game_of_life(asterisks, max_x, max_y, player_pos=None):
 
     next_asterisks = set()
     for pos in active_cells:
-        if neighbor_counts.get(pos, 0) in (2, 3):
+        if neighbor_counts.get(pos, 0) in (2, 3) and pos not in blocked:
             next_asterisks.add(pos)
 
     for pos, count in neighbor_counts.items():
-        if count == 3:
+        if count == 3 and pos not in blocked:
             next_asterisks.add(pos)
 
-    # The player's physical avatar (@) remains rendered independently
-    if player_pos in next_asterisks:
-        next_asterisks.remove(player_pos)
-
+    next_asterisks.difference_update(blocked)
+    next_asterisks.discard(player_pos)
     return next_asterisks
 
-def safe_addch(stdscr, y, x, char, attr=0):
+
+class Baddie:
+    """An arrow that hunts living cells and turns them into dead cells."""
+    __slots__ = ("x", "y", "dx", "dy")
+
+    def __init__(self, x, y, dx=1, dy=0):
+        self.x, self.y = x, y
+        if dx == 0 and dy == 0:
+            dx = 1
+        self.dx, self.dy = dx, dy
+
+    @property
+    def pos(self):
+        return (self.x, self.y)
+
+    def glyph(self):
+        """Arrow pointing along the current heading."""
+        if abs(self.dx) >= abs(self.dy):
+            return ">" if self.dx > 0 else "<"
+        return "v" if self.dy > 0 else "^"
+
+
+def update_baddies(baddies, asterisks, dead_cells, max_x, max_y, rng=None):
+    """Move every baddie one cell. Baddies hunt the nearest living cell;
+    with no prey they wander. Any living cell they occupy dies -> X."""
+    rng = rng or random
+    occupied = {b.pos for b in baddies}
+    for b in baddies:
+        occupied.discard(b.pos)
+
+        # Eat anything that appeared under us (e.g. a birth on our cell)
+        if b.pos in asterisks:
+            asterisks.discard(b.pos)
+            dead_cells.add(b.pos)
+
+        steps = []
+        if asterisks:
+            tx, ty = min(asterisks, key=lambda s: abs(s[0] - b.x) + abs(s[1] - b.y))
+            ox = (tx > b.x) - (tx < b.x)
+            oy = (ty > b.y) - (ty < b.y)
+            if ox and oy:
+                steps.append((ox, oy))
+            if abs(tx - b.x) >= abs(ty - b.y):
+                if ox:
+                    steps.append((ox, 0))
+                if oy:
+                    steps.append((0, oy))
+            else:
+                if oy:
+                    steps.append((0, oy))
+                if ox:
+                    steps.append((ox, 0))
+            if rng.random() < 0.2:
+                rng.shuffle(steps)  # jitter to break gridlock
+        if not steps:
+            if rng.random() < 0.35:
+                steps = [(rng.choice((-1, 0, 1)), rng.choice((-1, 0, 1)))]
+            else:
+                steps = [(b.dx, b.dy)]
+
+        for sx, sy in steps + [(0, 0)]:
+            nx, ny = b.x + sx, b.y + sy
+            if not (1 <= nx <= max_x and 1 <= ny <= max_y):
+                continue
+            if (nx, ny) in occupied:
+                continue
+            b.x, b.y = nx, ny
+            if sx or sy:
+                b.dx, b.dy = sx, sy
+            break
+        occupied.add(b.pos)
+
+        # Eat whatever we landed on
+        if b.pos in asterisks:
+            asterisks.discard(b.pos)
+            dead_cells.add(b.pos)
+
+
+def save_game(path, state):
+    state["saved_at"] = datetime.now().isoformat(timespec="seconds")
+    with open(path, "w") as f:
+        json.dump(state, f, indent=1)
+
+
+def load_game(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+# ------------------------------------------------------------ Input helpers
+
+def pressed(controller, btn):
+    return btn < controller.get_numbuttons() and controller.get_button(btn)
+
+
+def read_nav(controller):
+    """D-pad (hat) first, left analog as fallback. Returns (dx, dy) in -1..1."""
+    dx = dy = 0
+    if controller.get_numhats() > 0:
+        hat_x, hat_y = controller.get_hat(0)
+        dx, dy = hat_x, -hat_y
+    if dx == 0 and dy == 0:
+        ax = controller.get_axis(0)
+        ay = controller.get_axis(1)
+        if ax < -0.5:
+            dx = -1
+        elif ax > 0.5:
+            dx = 1
+        if ay < -0.5:
+            dy = -1
+        elif ay > 0.5:
+            dy = 1
+    return dx, dy
+
+
+def wait_for_release(controller, timeout=2.0):
+    """Block until every button is up. Prevents the press that opened a
+    menu from instantly triggering actions inside it."""
+    start = time.time()
+    while time.time() - start < timeout:
+        pygame.event.pump()
+        if not any(controller.get_button(i) for i in range(controller.get_numbuttons())):
+            return
+        time.sleep(0.02)
+
+
+# ----------------------------------------------------------- Curses helpers
+
+def safe_addch(win, y, x, ch, attr=0):
     try:
-        stdscr.addch(y, x, char, attr)
-    except curses.error:
+        win.addch(y, x, ch, attr)
+    except (curses.error, UnicodeEncodeError):
         pass
 
-def run_gallery_menu(stdscr, controller, sw, sh):
-    """Full-screen grid view to browse and select shapes using PS3 controller."""
-    selected_idx = 0
-    btn_cooldown = 0
-    move_cooldown = 0
 
-    stdscr.clear()
+def safe_addstr(win, y, x, s, attr=0):
+    try:
+        win.addstr(y, x, s, attr)
+    except (curses.error, UnicodeEncodeError):
+        pass
+
+
+# --------------------------------------------------------------------- Menus
+
+def run_menu(stdscr, controller, sw, sh, title, items,
+             hint="D-Pad: move   X/O: choose   SELECT: back"):
+    """Generic vertical menu. items = [(key, label), ...].
+    Returns the chosen key, or None when cancelled."""
+    wait_for_release(controller)
+    sel = 0
+    move_cd = time.time()
 
     while True:
         pygame.event.pump()
         now = time.time()
 
-        dx, dy = 0, 0
-        if controller.get_numhats() > 0:
-            hat_x, hat_y = controller.get_hat(0)
-            if hat_x != 0: dx = hat_x
-            if hat_y != 0: dy = -hat_y
+        _, dy = read_nav(controller)
+        if dy and now - move_cd > 0.18:
+            move_cd = now
+            sel = (sel + (1 if dy > 0 else -1)) % len(items)
 
-        if dx == 0 and dy == 0:
-            ax = controller.get_axis(0)
-            ay = controller.get_axis(1)
-            if ax < -0.5: dx = -1
-            elif ax > 0.5: dx = 1
-            if ay < -0.5: dy = -1
-            elif ay > 0.5: dy = 1
+        if pressed(controller, BTN_X) or pressed(controller, BTN_CIRCLE):
+            wait_for_release(controller)
+            return items[sel][0]
+        if pressed(controller, BTN_SELECT) or pressed(controller, BTN_START):
+            wait_for_release(controller)
+            return None
 
-        if (dx != 0 or dy != 0) and (now - move_cooldown > 0.15):
-            move_cooldown = now
-            if dx > 0: selected_idx = min(len(ALL_PATTERNS) - 1, selected_idx + 1)
-            elif dx < 0: selected_idx = max(0, selected_idx - 1)
-            if dy > 0: selected_idx = min(len(ALL_PATTERNS) - 1, selected_idx + 2)
-            elif dy < 0: selected_idx = max(0, selected_idx - 2)
-
-        # Select shape with X (0) or O (1)
-        if (controller.get_button(0) or controller.get_button(1)) and (now - btn_cooldown > 0.2):
-            return selected_idx
-
-        # Exit gallery with SELECT (8) or START (9)
-        if (controller.get_button(8) or controller.get_button(9)) and (now - btn_cooldown > 0.3):
-            return selected_idx
-
-        # Render Gallery View
-        stdscr.clear()
-        stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+        stdscr.erase()
+        attr = curses.color_pair(4) | curses.A_BOLD
+        stdscr.attron(attr)
         stdscr.border(0, 0, 0, 0, 0, 0, 0, 0)
-        stdscr.addstr(0, 4, " GALLERY MENU (D-Pad: Navigate | X/O: Select Shape) ")
-        stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+        stdscr.attroff(attr)
+        safe_addstr(stdscr, 0, max(2, (sw - len(title) - 2) // 2), f" {title} ", attr)
 
-        # Draw 2-column Grid
-        col_width = (sw - 10) // 2
-        for i, (p_name, p_offsets) in enumerate(ALL_PATTERNS):
-            col = i % 2
-            row = i // 2
-            start_x = 5 + col * col_width
-            start_y = 3 + row * 6
+        y0 = max(2, sh // 2 - len(items))
+        x0 = max(4, sw // 2 - 18)
+        for i, (_, label) in enumerate(items):
+            line_attr = (curses.color_pair(1) | curses.A_BOLD) if i == sel else curses.color_pair(3)
+            safe_addstr(stdscr, y0 + i, x0, ("-> " if i == sel else "   ") + label, line_attr)
 
-            is_sel = (i == selected_idx)
-            attr = curses.color_pair(1) | curses.A_BOLD if is_sel else curses.color_pair(3)
-            prefix = "-> " if is_sel else "   "
-
-            try:
-                stdscr.addstr(start_y, start_x, f"{prefix}{p_name}", attr)
-            except curses.error:
-                pass
-
-            # Render mini pattern preview
-            for ox, oy in p_offsets:
-                px_view = start_x + 4 + ox
-                py_view = start_y + 2 + oy
-                safe_addch(stdscr, py_view, px_view, '*', curses.color_pair(2))
-
+        safe_addstr(stdscr, sh - 2, max(2, (sw - len(hint)) // 2), hint, curses.color_pair(2))
         stdscr.refresh()
         time.sleep(0.02)
+
+
+def run_gallery_menu(stdscr, controller, sw, sh):
+    """Browse placeable patterns. Returns ALL_PATTERNS index, or None."""
+    wait_for_release(controller)
+    sel = 0
+    move_cd = time.time()
+    hint = "D-Pad: browse   X/O: choose shape   SELECT: back"
+
+    while True:
+        pygame.event.pump()
+        now = time.time()
+
+        dx, dy = read_nav(controller)
+        nav = dy or dx
+        if nav and now - move_cd > 0.16:
+            move_cd = now
+            sel = (sel + (1 if nav > 0 else -1)) % len(ALL_PATTERNS)
+
+        if pressed(controller, BTN_X) or pressed(controller, BTN_CIRCLE):
+            wait_for_release(controller)
+            return sel
+        if pressed(controller, BTN_SELECT) or pressed(controller, BTN_START):
+            wait_for_release(controller)
+            return None
+
+        stdscr.erase()
+        attr = curses.color_pair(4) | curses.A_BOLD
+        stdscr.attron(attr)
+        stdscr.border(0, 0, 0, 0, 0, 0, 0, 0)
+        stdscr.attroff(attr)
+        safe_addstr(stdscr, 0, 4, " GALLERY OF PLACEABLES ", attr)
+
+        # Left: pattern list
+        for i, (name, _) in enumerate(ALL_PATTERNS):
+            y = 3 + i
+            if y >= sh - 3:
+                break
+            cat = "OSC" if i < len(PATTERNS_OSCILLATORS) else "STATIC"
+            line_attr = (curses.color_pair(1) | curses.A_BOLD) if i == sel else curses.color_pair(3)
+            safe_addstr(stdscr, y, 4, f"{'-> ' if i == sel else '   '}{name:<13} {cat}", line_attr)
+
+        # Right: preview of the selected pattern ('@' marks the stamp anchor)
+        name, offsets = ALL_PATTERNS[sel]
+        minx = min(o[0] for o in offsets)
+        maxx = max(o[0] for o in offsets)
+        miny = min(o[1] for o in offsets)
+        maxy = max(o[1] for o in offsets)
+        w = maxx - minx + 1
+        h = maxy - miny + 1
+        base_x = min(sw - w - 4, 3 * sw // 4 - w // 2)
+        base_y = max(4, sh // 2 - h // 2)
+        safe_addstr(stdscr, base_y - 2, base_x, f"{name}  (@ = you)",
+                    curses.color_pair(4) | curses.A_BOLD)
+        for ox, oy in offsets:
+            cx = base_x + ox - minx
+            cy = base_y + oy - miny
+            if (ox, oy) == (0, 0):
+                safe_addch(stdscr, cy, cx, "@", curses.color_pair(1) | curses.A_BOLD)
+            else:
+                safe_addch(stdscr, cy, cx, "*", curses.color_pair(2))
+
+        safe_addstr(stdscr, sh - 2, max(2, (sw - len(hint)) // 2), hint, curses.color_pair(2))
+        stdscr.refresh()
+        time.sleep(0.02)
+
+
+# -------------------------------------------------------------------- Main
 
 def main(stdscr):
     pygame.init()
@@ -152,200 +355,256 @@ def main(stdscr):
     curses.curs_set(0)
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_CYAN, -1)    # Cursor / Active Preview
-    curses.init_pair(2, curses.COLOR_YELLOW, -1)  # Placed Stars
-    curses.init_pair(3, curses.COLOR_GREEN, -1)   # Run Border
-    curses.init_pair(4, curses.COLOR_MAGENTA, -1) # Shape Name Label
-    curses.init_pair(5, curses.COLOR_RED, -1)     # Setup Border
+    curses.init_pair(1, curses.COLOR_CYAN, -1)     # @ / preview / selection
+    curses.init_pair(2, curses.COLOR_YELLOW, -1)   # living cells
+    curses.init_pair(3, curses.COLOR_GREEN, -1)    # run border / menu text
+    curses.init_pair(4, curses.COLOR_MAGENTA, -1)  # titles / messages
+    curses.init_pair(5, curses.COLOR_RED, -1)      # X dead cells / setup border
+    curses.init_pair(6, curses.COLOR_WHITE, -1)    # baddies
 
     stdscr.nodelay(True)
     stdscr.timeout(30)
 
     sh, sw = stdscr.getmaxyx()
     max_x, max_y = sw - 2, sh - 2
+    rng = random.Random()
 
     px, py = sw // 2, sh // 2
 
     asterisks = set()
     for _ in range(15):
         asterisks.add((random.randint(2, max_x - 1), random.randint(2, max_y - 1)))
+    dead_cells = set()
+    baddies = []
 
-    is_running = False  # Start in Setup Mode
+    is_running = False
     pattern_idx = 0
     static_pattern_idx = 0
-    active_category = "dynamic" # "dynamic" or "static"
+    active_category = "dynamic"
 
-    move_cooldown = 0
-    stamp_btn_cooldown = 0
-    cycle_btn_cooldown = 0
-    mode_btn_cooldown = 0
-    gol_cooldown = 0
+    move_cd = act_cd = erase_cd = stamp_cd = cycle_cd = 0.0
+    mode_cd = menu_cd = gol_cd = baddie_cd = 0.0
+    message, message_until = "", 0.0
 
-    last_rendered_cursor = set()
-    stdscr.clear()
+    def flash(text, dur=2.2):
+        nonlocal message, message_until
+        message, message_until = text, time.time() + dur
 
     while True:
-        dx, dy = 0, 0
         pygame.event.pump()
-
-        # D-Pad Movement
-        if controller.get_numhats() > 0:
-            hat_x, hat_y = controller.get_hat(0)
-            if hat_x != 0: dx = hat_x
-            if hat_y != 0: dy = -hat_y
-
-        # Analog Movement
-        if dx == 0 and dy == 0:
-            ax = controller.get_axis(0)
-            ay = controller.get_axis(1)
-            if ax < -0.5: dx = -1
-            elif ax > 0.5: dx = 1
-            if ay < -0.5: dy = -1
-            elif ay > 0.5: dy = 1
-
-        # START (Button 9) or Button 10 to quit
-        if controller.get_button(9) or controller.get_button(10):
-            break
-
         now = time.time()
-        need_full_redraw = False
+        dx, dy = read_nav(controller)
 
-        # Open Full-Screen Gallery Menu with SELECT (Button 8)
-        if controller.get_button(8) and (now - mode_btn_cooldown > 0.3):
-            mode_btn_cooldown = now
-            chosen_idx = run_gallery_menu(stdscr, controller, sw, sh)
-            if chosen_idx < len(PATTERNS_OSCILLATORS):
-                active_category = "dynamic"
-                pattern_idx = chosen_idx
-            else:
-                active_category = "static"
-                static_pattern_idx = chosen_idx - len(PATTERNS_OSCILLATORS)
-            is_running = False
-            need_full_redraw = True
+        # ---- System menu: SELECT / START / PS ----
+        if (pressed(controller, BTN_SELECT) or pressed(controller, BTN_START)
+                or pressed(controller, BTN_PS)) and now - menu_cd > 0.3:
+            menu_cd = now
+            items = [("resume", "Resume"),
+                     ("gallery", "Gallery of placeables ..."),
+                     ("save", "Save game")]
+            if os.path.exists(SAVE_PATH):
+                items.append(("load", "Load game"))
+            items += [("clear", "Clear board"),
+                      ("quit", "Quit")]
+            action = run_menu(stdscr, controller, sw, sh, "WANDER MENU", items)
 
-        # Toggle Setup / Run Mode via TRIANGLE (Button 2)
-        if controller.get_button(2) and (now - mode_btn_cooldown > 0.3):
-            mode_btn_cooldown = now
+            if action == "quit":
+                break
+            elif action == "gallery":
+                chosen = run_gallery_menu(stdscr, controller, sw, sh)
+                if chosen is not None:
+                    if chosen < len(PATTERNS_OSCILLATORS):
+                        active_category, pattern_idx = "dynamic", chosen
+                    else:
+                        active_category = "static"
+                        static_pattern_idx = chosen - len(PATTERNS_OSCILLATORS)
+                    is_running = False
+                    flash(f"Active shape: {ALL_PATTERNS[chosen][0]}")
+            elif action == "save":
+                try:
+                    save_game(SAVE_PATH, {
+                        "version": 1,
+                        "player": [px, py],
+                        "is_running": is_running,
+                        "asterisks": sorted(list(p) for p in asterisks),
+                        "dead_cells": sorted(list(p) for p in dead_cells),
+                        "baddies": [{"pos": [b.x, b.y], "dir": [b.dx, b.dy]}
+                                    for b in baddies],
+                        "category": active_category,
+                        "pattern_idx": pattern_idx,
+                        "static_idx": static_pattern_idx,
+                    })
+                    flash("Game saved")
+                except Exception as e:
+                    flash(f"Save failed: {e}", 3.5)
+            elif action == "load":
+                try:
+                    st = load_game(SAVE_PATH)
+                    asterisks = {(int(x), int(y)) for x, y in st.get("asterisks", [])}
+                    dead_cells = {(int(x), int(y)) for x, y in st.get("dead_cells", [])}
+                    asterisks = {p for p in asterisks if 1 <= p[0] <= max_x and 1 <= p[1] <= max_y}
+                    dead_cells = {p for p in dead_cells if 1 <= p[0] <= max_x and 1 <= p[1] <= max_y}
+                    asterisks -= dead_cells
+                    baddies = []
+                    for bd in st.get("baddies", []):
+                        bx = min(max(int(bd["pos"][0]), 1), max_x)
+                        by = min(max(int(bd["pos"][1]), 1), max_y)
+                        bdx, bdy = (bd.get("dir") or [1, 0])[:2]
+                        baddies.append(Baddie(bx, by, int(bdx), int(bdy)))
+                    px = min(max(int(st.get("player", [px, py])[0]), 1), max_x)
+                    py = min(max(int(st.get("player", [px, py])[1]), 1), max_y)
+                    is_running = bool(st.get("is_running", False))
+                    if st.get("category") in ("dynamic", "static"):
+                        active_category = st["category"]
+                    pattern_idx = int(st.get("pattern_idx", 0)) % len(PATTERNS_OSCILLATORS)
+                    static_pattern_idx = int(st.get("static_idx", 0)) % len(PATTERNS_STATIC)
+                    flash(f"Loaded (saved {st.get('saved_at', '?')})")
+                except Exception as e:
+                    flash(f"Load failed: {e}", 3.5)
+            elif action == "clear":
+                asterisks.clear()
+                dead_cells.clear()
+                baddies.clear()
+                flash("Board cleared")
+
+        # ---- Toggle setup / run (TRIANGLE) ----
+        if pressed(controller, BTN_TRIANGLE) and now - mode_cd > 0.3:
+            mode_cd = now
             is_running = not is_running
-            need_full_redraw = True
 
-        # Cycle Active Patterns via L1 (4) / R1 (5) in Setup Mode
-        if not is_running and (now - cycle_btn_cooldown > 0.18):
-            if controller.get_button(4):
+        # ---- SQUARE: kill star under @ / spawn baddie from adjacent X ----
+        if pressed(controller, BTN_SQUARE) and now - act_cd > 0.25:
+            act_cd = now
+            if (px, py) in asterisks:
+                asterisks.discard((px, py))
+                dead_cells.add((px, py))
+                flash("Star slain -> X")
+            else:
+                near = [(px + ox, py + oy)
+                        for oy in (-1, 0, 1) for ox in (-1, 0, 1)
+                        if (px + ox, py + oy) in dead_cells]
+                if near:
+                    t = min(near, key=lambda c: abs(c[0] - px) + abs(c[1] - py))
+                    dead_cells.discard(t)
+                    baddies.append(Baddie(t[0], t[1],
+                                          rng.choice((-1, 0, 1)), rng.choice((-1, 0, 1))))
+                    flash("Baddie spawned! It hunts stars.")
+                else:
+                    flash("Stand on * to kill it, or beside X to spawn a baddie", 2.8)
+
+        # ---- X button: erase star / reclaim X / neutralize baddie ----
+        if pressed(controller, BTN_X) and now - erase_cd > 0.25:
+            erase_cd = now
+            if (px, py) in asterisks:
+                asterisks.discard((px, py))
+                flash("Star erased")
+            elif (px, py) in dead_cells:
+                dead_cells.discard((px, py))
+                flash("Cell reclaimed")
+            else:
+                hit = next((i for i, b in enumerate(baddies) if b.pos == (px, py)), None)
+                if hit is not None:
+                    del baddies[hit]
+                    dead_cells.add((px, py))
+                    flash("Baddie neutralized -> X")
+
+        # ---- Cycle patterns (setup only) ----
+        if not is_running and now - cycle_cd > 0.18:
+            if pressed(controller, BTN_L1):
                 active_category = "dynamic"
                 pattern_idx = (pattern_idx - 1) % len(PATTERNS_OSCILLATORS)
-                cycle_btn_cooldown = now
-            elif controller.get_button(5):
+                cycle_cd = now
+            elif pressed(controller, BTN_R1):
                 active_category = "dynamic"
                 pattern_idx = (pattern_idx + 1) % len(PATTERNS_OSCILLATORS)
-                cycle_btn_cooldown = now
-
-        # Cycle Static Forms via L2 (6) / R2 (7) in Setup Mode
-        if not is_running and (now - cycle_btn_cooldown > 0.18):
-            if controller.get_button(6):
+                cycle_cd = now
+            elif pressed(controller, BTN_L2):
                 active_category = "static"
                 static_pattern_idx = (static_pattern_idx - 1) % len(PATTERNS_STATIC)
-                cycle_btn_cooldown = now
-            elif controller.get_button(7):
+                cycle_cd = now
+            elif pressed(controller, BTN_R2):
                 active_category = "static"
                 static_pattern_idx = (static_pattern_idx + 1) % len(PATTERNS_STATIC)
-                cycle_btn_cooldown = now
+                cycle_cd = now
 
-        # Clear Screen with SQUARE (Button 3) in Setup Mode
-        if not is_running and controller.get_button(3) and (now - stamp_btn_cooldown > 0.2):
-            stamp_btn_cooldown = now
-            asterisks.clear()
-            need_full_redraw = True
-
-        # Current shape determination
         if active_category == "dynamic":
             p_name, p_offsets = PATTERNS_OSCILLATORS[pattern_idx]
         else:
             p_name, p_offsets = PATTERNS_STATIC[static_pattern_idx]
 
-        # Stamp Pattern with CIRCLE (Button 1) in Setup Mode
-        if not is_running and controller.get_button(1) and (now - stamp_btn_cooldown > 0.2):
-            stamp_btn_cooldown = now
+        # ---- CIRCLE: stamp pattern (setup only; X cells are unoccupiable) ----
+        if not is_running and pressed(controller, BTN_CIRCLE) and now - stamp_cd > 0.2:
+            stamp_cd = now
+            placed = 0
             for ox, oy in p_offsets:
-                tx, ty = px + ox, py + oy
-                if 1 <= tx <= max_x and 1 <= ty <= max_y:
-                    asterisks.add((tx, ty))
+                t = (px + ox, py + oy)
+                if 1 <= t[0] <= max_x and 1 <= t[1] <= max_y and t not in dead_cells:
+                    asterisks.add(t)
+                    placed += 1
+            if placed < len(p_offsets):
+                flash("Some cells blocked by X")
 
-        # Erase single star under cursor with X (Button 0) in Setup Mode
-        if not is_running and controller.get_button(0) and (now - stamp_btn_cooldown > 0.2):
-            stamp_btn_cooldown = now
-            if (px, py) in asterisks:
-                asterisks.remove((px, py))
-                safe_addch(stdscr, py, px, ' ')
-
-        # Execute Movement
-        if (dx != 0 or dy != 0) and (now - move_cooldown > 0.08):
-            move_cooldown = now
+        # ---- Movement ----
+        if (dx or dy) and now - move_cd > 0.08:
+            move_cd = now
             px = max(1, min(max_x, px + dx))
             py = max(1, min(max_y, py + dy))
 
-        # Game of Life Tick (Run mode - cursor acts as living cell)
-        if is_running and (now - gol_cooldown > 0.4):
-            gol_cooldown = now
-            for ax_pos, ay_pos in asterisks:
-                safe_addch(stdscr, ay_pos, ax_pos, ' ')
-            asterisks = step_game_of_life(asterisks, max_x, max_y, player_pos=(px, py))
+        # ---- Game of Life tick (run mode; @ is a living cell) ----
+        if is_running and now - gol_cd > 0.4:
+            gol_cd = now
+            asterisks = step_game_of_life(asterisks, max_x, max_y,
+                                          blocked=dead_cells, player_pos=(px, py))
 
-        # Redraw Screen
-        if need_full_redraw:
-            stdscr.clear()
+        # ---- Baddies tick (both modes) ----
+        if baddies and now - baddie_cd > 0.18:
+            baddie_cd = now
+            update_baddies(baddies, asterisks, dead_cells, max_x, max_y, rng)
 
-        # Border & Mode Header
-        border_color = curses.color_pair(3) if is_running else curses.color_pair(5)
-        stdscr.attron(border_color)
+        # ---- Render ----
+        stdscr.erase()
+        border_attr = curses.color_pair(3) if is_running else curses.color_pair(5)
+        stdscr.attron(border_attr)
         stdscr.border(0, 0, 0, 0, 0, 0, 0, 0)
-        mode_label = "[ RUNNING ] (△: Setup | @ Interfere)" if is_running else "[ SETUP ] (L1/R1: Oscillators | L2/R2: Static | □: Clear | SELECT: Gallery)"
-        stdscr.addstr(0, 4, f" {mode_label} ")
-        stdscr.attroff(border_color)
+        stdscr.attroff(border_attr)
 
-        # Draw Asterisks
-        for ax_pos, ay_pos in asterisks:
-            safe_addch(stdscr, ay_pos, ax_pos, '*', curses.color_pair(2))
+        if is_running:
+            head = "[ RUN ]  □:kill/spawn  ✕:erase  △:setup  SEL:menu"
+        else:
+            head = "[ SETUP ]  □:kill/spawn  ○:stamp  ✕:erase  △:run  SEL:menu"
+        safe_addstr(stdscr, 0, 4, f" {head} ", border_attr | curses.A_BOLD)
+        stats = f" *{len(asterisks)} X{len(dead_cells)} B{len(baddies)} ({px},{py}) "
+        safe_addstr(stdscr, 0, max(1, sw - len(stats) - 2), stats, border_attr)
 
-        # Clear previous cursor trail
-        for cx, cy in last_rendered_cursor:
-            if (cx, cy) in asterisks:
-                safe_addch(stdscr, cy, cx, '*', curses.color_pair(2))
-            else:
-                safe_addch(stdscr, cy, cx, ' ')
-        last_rendered_cursor.clear()
+        for cx, cy in dead_cells:
+            safe_addch(stdscr, cy, cx, "X", curses.color_pair(5))
+        for cx, cy in asterisks:
+            safe_addch(stdscr, cy, cx, "*", curses.color_pair(2))
+        for b in baddies:
+            safe_addch(stdscr, b.y, b.x, b.glyph(), curses.color_pair(6) | curses.A_BOLD)
 
-        # Render Cursor / Active Stamp Preview
         if not is_running:
             for ox, oy in p_offsets:
                 cx, cy = px + ox, py + oy
                 if 1 <= cx <= max_x and 1 <= cy <= max_y:
-                    safe_addch(stdscr, cy, cx, '*', curses.color_pair(1) | curses.A_BOLD)
-                    last_rendered_cursor.add((cx, cy))
-
-            # Shape Footer
-            footer = f" Active Shape: {p_name} ({active_category.upper()}) "
-            try:
-                stdscr.addstr(sh - 1, 4, footer + " " * 5, curses.color_pair(4) | curses.A_BOLD)
-            except curses.error:
-                pass
+                    safe_addch(stdscr, cy, cx, "*", curses.color_pair(1) | curses.A_BOLD)
+            foot = f" Shape: {p_name} ({active_category})   L1/R1: osc   L2/R2: static "
         else:
-            safe_addch(stdscr, py, px, '@', curses.color_pair(1) | curses.A_BOLD)
-            last_rendered_cursor.add((px, py))
-            try:
-                stdscr.addstr(sh - 1, 4, " " * 45, curses.color_pair(3))
-            except curses.error:
-                pass
+            foot = " @ is a living cell in the sim "
+        safe_addstr(stdscr, sh - 1, 4, foot, curses.color_pair(4) | curses.A_BOLD)
 
-        # Top Right Stats
-        header = f" Pos: ({px},{py}) | Stars: {len(asterisks)} "
-        try:
-            stdscr.addstr(0, max(0, sw - len(header) - 4), header, border_color)
-        except curses.error:
-            pass
+        # @ always drawn on top
+        safe_addch(stdscr, py, px, "@", curses.color_pair(1) | curses.A_BOLD)
+
+        if now < message_until:
+            safe_addstr(stdscr, sh - 1, max(1, sw - len(message) - 3), message,
+                        curses.color_pair(4) | curses.A_BOLD)
 
         stdscr.refresh()
-        time.sleep(0.01)
+        time.sleep(0.02)
+
+    pygame.quit()
+
 
 if __name__ == "__main__":
     curses.wrapper(main)
