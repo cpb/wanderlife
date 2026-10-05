@@ -508,7 +508,8 @@ def main(stdscr):
         if is_running and now - gol_cd > GOL_TICK:
             gol_cd = now
             asterisks = step_game_of_life(asterisks, max_x, max_y,
-                                          blocked=dead_cells, player_pos=(px, py))
+                                          blocked=dead_cells,
+                                          player_positions={(px, py)})
 
         # ---- Baddies tick: frozen in setup mode or when stopped (R3) ----
         if baddies and now - baddie_cd > BADDIE_TICK:

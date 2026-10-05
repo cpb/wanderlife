@@ -31,12 +31,16 @@ python3 wander_client.py
 
 The client opens at the **world menu**: play an existing world (`X`),
 watch one (`TRIANGLE` / `w`), create a new one, or delete one (**SQUARE
-twice**). **Multiple clients can attach to the same world** — `play`
-clients share the one `@` (chaos is a feature), `watch` clients are
-read-only. Worlds live in `~/wander_worlds/*.json`, are saved (dirty-only,
-on a background thread) every 30 s and on detach/shutdown, and **keep
-evolving in the background at 1/20 speed** (`BACKGROUND_SLOWDOWN`) while
-no client is attached — full speed while anyone is playing.
+twice**). **Multiple clients can attach to the same world, and every
+`play` client spawns its own `@`** — your avatar is cyan, everyone else's
+is green; kill radius, pattern selection and movement are all per-player.
+Avatars spawn on attach and despawn on detach (they're never persisted);
+`watch` clients are read-only and get no avatar. Action flashes are
+prefixed `@pN:` so you can tell who did what. Worlds live in
+`~/wander_worlds/*.json`, are saved (dirty-only, on a background thread)
+every 30 s and on detach/shutdown, and **keep evolving in the background
+at 1/20 speed** (`BACKGROUND_SLOWDOWN`) while no client is attached —
+full speed while anyone is playing.
 
 Keyboard controls (when no controller is present): arrows/hjkl/wasd move,
 `SPACE`=SQUARE, `x`=X, `o`=CIRCLE, `t`=TRIANGLE, `[`/`]`=L1/R1,
@@ -110,17 +114,18 @@ python3 test_wander.py          # game-logic tests (pygame stubbed)
 python3 test_wander_server.py   # World + server protocol tests (pure python)
 ```
 
-### Client/server protocol (v2)
+### Client/server protocol (v3)
 
 Newline-delimited JSON over the UNIX socket `~/wander_server.sock`.
-Every message carries the protocol version (`"v": 2`); mismatches are
+Every message carries the protocol version (`"v": 3`); mismatches are
 rejected. Client: `list` / `create` / `delete` / `attach` (with
-`role: play|watch`) / `detach` / `input` (move + button actions) /
-`command` (save, clear, seed, stop_baddies, set_pattern). Server replies
-`{"ok": ...}` and streams frames at 10 Hz: the first frame is full
-state, later frames are **deltas** containing only changed fields
-(nothing is sent while the world is unchanged; a 5 s heartbeat proves
-liveness).
+`role: play|watch`; play clients get a `pid` and a spawned avatar) /
+`detach` / `input` (move + button actions, applied to the caller's own
+avatar) / `command` (save, clear, seed, stop_baddies, set_pattern).
+Server replies `{"ok": ...}` and streams frames at 10 Hz: the attach
+response is the client's full snapshot, later frames are **deltas**
+containing only changed fields (nothing is sent while the world is
+unchanged; a 5 s heartbeat proves liveness).
 
 ## Deployment
 

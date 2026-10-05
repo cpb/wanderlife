@@ -469,11 +469,22 @@ def baddie_glyph(bdx, bdy):
     return "v" if bdy > 0 else "^"
 
 
-def render_state(stdscr, state, ast_set, dead_set, px, py, sw, sh, role):
+def find_player(state, pid):
+    if pid is None:
+        return None
+    for p in state.get("players", []):
+        if p["pid"] == pid:
+            return p
+    return None
+
+
+def render_state(stdscr, state, ast_set, dead_set, my, pred_pos, sw, sh, role):
     max_x, max_y = state["max_x"], state["max_y"]
     is_running = state["is_running"]
-    kill_radius = state["kill_radius"]
     now = time.time()
+    px, py = pred_pos
+    players = state.get("players", [])
+    my_radius = my["kill_radius"] if my else 0
 
     stdscr.erase()
     border_attr = curses.color_pair(3) if is_running else curses.color_pair(5)
@@ -489,14 +500,16 @@ def render_state(stdscr, state, ast_set, dead_set, px, py, sw, sh, role):
         head = "[ SETUP ] □:kill/spawn ○:stamp ✕:erase(✕✕:clear) △:run SEL:menu"
     safe_addstr(stdscr, 0, 4, f" {head} ", border_attr | curses.A_BOLD)
     bmark = "s" if state["baddies_stopped"] else ""
-    stats = (f" *{len(ast_set)} X{len(dead_set)}"
-             f" B{len(state['baddies'])}{bmark} R{kill_radius} ({px},{py}) ")
+    rtxt = f"R{my_radius}" if my else ""
+    stats = (f" *{len(ast_set)} X{len(dead_set)} B{len(state['baddies'])}{bmark}"
+             f" P{len(players)} {rtxt} ({px},{py}) ")
     safe_addstr(stdscr, 0, max(1, sw - len(stats) - 2), stats, border_attr)
 
-    if kill_radius > 0 and role != "watch":
-        for oy in range(-kill_radius, kill_radius + 1):
-            for ox in range(-kill_radius, kill_radius + 1):
-                if max(abs(ox), abs(oy)) != kill_radius:
+    # Area-of-effect outline of MY SQUARE kill zone
+    if my and my_radius > 0:
+        for oy in range(-my_radius, my_radius + 1):
+            for ox in range(-my_radius, my_radius + 1):
+                if max(abs(ox), abs(oy)) != my_radius:
                     continue
                 cx, cy = px + ox, py + oy
                 if 1 <= cx <= max_x and 1 <= cy <= max_y:
@@ -513,19 +526,28 @@ def render_state(stdscr, state, ast_set, dead_set, px, py, sw, sh, role):
         safe_addch(stdscr, b["pos"][1], b["pos"][0],
                    baddie_glyph(b["dir"][0], b["dir"][1]), battr)
 
-    if not is_running and role != "watch":
-        for ox, oy in state["pattern_offsets"]:
+    # Other players' avatars in green
+    for p in players:
+        if my and p["pid"] == my["pid"]:
+            continue
+        safe_addch(stdscr, p["pos"][1], p["pos"][0], "@",
+                   curses.color_pair(3) | curses.A_BOLD)
+
+    if my and not is_running and role == "play":
+        for ox, oy in my["pattern_offsets"]:
             cx, cy = px + ox, py + oy
             if 1 <= cx <= max_x and 1 <= cy <= max_y:
                 safe_addch(stdscr, cy, cx, "*", curses.color_pair(1) | curses.A_BOLD)
-        foot = f" Shape: {state['pattern_name']} ({state['category']})   L1/R1: osc   L2/R2: static "
+        foot = f" Shape: {my['pattern_name']} ({my['category']})   L1/R1: osc   L2/R2: static "
     elif role == "watch":
         foot = f" watching {state['name']} -- inputs ignored "
     else:
         foot = " @ is a living cell in the sim "
     safe_addstr(stdscr, sh - 1, 4, foot, curses.color_pair(4) | curses.A_BOLD)
 
-    safe_addch(stdscr, py, px, "@", curses.color_pair(1) | curses.A_BOLD)
+    # My avatar on top
+    if my:
+        safe_addch(stdscr, py, px, "@", curses.color_pair(1) | curses.A_BOLD)
 
     msg = state.get("last_message", "")
     if msg and now - state.get("message_time", 0.0) < 2.8:
@@ -534,11 +556,15 @@ def render_state(stdscr, state, ast_set, dead_set, px, py, sw, sh, role):
     stdscr.refresh()
 
 
-def play_world(stdscr, inp, conn, state, sw, sh, role):
+def play_world(stdscr, inp, conn, state, sw, sh, role, my_pid):
     """Attached gameplay: inputs -> server, server delta frames -> render."""
     inp.release_sync()
     move_cd = 0.0
-    pred_x, pred_y = state["px"], state["py"]  # optimistic @ position
+    my = find_player(state, my_pid)
+    if my:
+        pred_x, pred_y = my["pos"]          # optimistic own-@ position
+    else:
+        pred_x, pred_y = state["max_x"] // 2, state["max_y"] // 2
     ast_set = {tuple(p) for p in state["asterisks"]}
     dead_set = {tuple(p) for p in state["dead_cells"]}
 
@@ -563,7 +589,9 @@ def play_world(stdscr, inp, conn, state, sw, sh, role):
                         ast_set = {tuple(p) for p in state["asterisks"]}
                     if "dead_cells" in delta:
                         dead_set = {tuple(p) for p in state["dead_cells"]}
-                pred_x, pred_y = state["px"], state["py"]
+                my = find_player(state, my_pid)
+                if my:
+                    pred_x, pred_y = my["pos"]
         except (ConnectionError, OSError, ValueError):
             return "lost"
 

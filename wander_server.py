@@ -154,7 +154,10 @@ class Server:
     def drop(self, conn, sel):
         entry = self.attached.pop(conn, None)
         if entry and entry["name"] in self.worlds:
-            self.save_world(self.worlds[entry["name"]])
+            w = self.worlds[entry["name"]]
+            if entry.get("pid") is not None:
+                w.remove_player(entry["pid"])
+            self.save_world(w)
             print(f"client detached from {entry['name']!r}", flush=True)
         self.buffers.pop(conn, None)
         try:
@@ -223,20 +226,27 @@ class Server:
                     role = msg.get("role", "play")
                     if role not in ("play", "watch"):
                         role = "play"
+                    # Play clients spawn their own '@'; watchers get none.
+                    pid = w.add_player() if role == "play" else None
                     # The attach response doubles as the client's full
                     # frame; streamed frames are deltas from here on.
                     st = w.client_state()
                     self.attached[conn] = {"name": name, "role": role,
-                                           "sent_rev": w.rev, "last": st,
-                                           "last_send": time.time()}
+                                           "pid": pid, "sent_rev": w.rev,
+                                           "last": st, "last_send": time.time()}
                     print(f"client attached to {name!r} as {role} "
-                          f"({self.online_count(name)} online)", flush=True)
-                    self.send(conn, {"ok": True, "role": role, "state": st})
+                          f"(pid={pid}, {self.online_count(name)} online)",
+                          flush=True)
+                    self.send(conn, {"ok": True, "role": role, "pid": pid,
+                                     "state": st})
 
             elif cmd == "detach":
                 entry = self.attached.pop(conn, None)
                 if entry and entry["name"] in self.worlds:
-                    self.save_world(self.worlds[entry["name"]])
+                    w = self.worlds[entry["name"]]
+                    if entry.get("pid") is not None:
+                        w.remove_player(entry["pid"])
+                    self.save_world(w)
                     print(f"client detached from {entry['name']!r}", flush=True)
                 self.send(conn, {"ok": True})
 
@@ -250,9 +260,9 @@ class Server:
                     return  # watchers are read-only: ignore inputs silently
                 act = msg.get("action")
                 if act == "move":
-                    w.move(msg.get("dx", 0), msg.get("dy", 0))
+                    w.move(entry["pid"], msg.get("dx", 0), msg.get("dy", 0))
                 else:
-                    w.button(str(act))
+                    w.button(entry["pid"], str(act))
 
             elif cmd == "command":
                 entry = self.attached.get(conn)
@@ -268,13 +278,13 @@ class Server:
                     self.save_world(w)
                     w.flash("Game saved")
                 elif do == "clear":
-                    w.clear()
+                    w.clear(entry.get("pid"))
                 elif do == "seed":
-                    w.seed()
+                    w.seed(entry.get("pid"))
                 elif do == "stop_baddies":
-                    w.toggle_baddies()
+                    w.toggle_baddies(entry.get("pid"))
                 elif do == "set_pattern":
-                    w.set_pattern(int(msg.get("idx", 0)))
+                    w.set_pattern(entry.get("pid"), int(msg.get("idx", 0)))
 
             else:
                 self.send(conn, {"ok": False, "error": "unknown command"})

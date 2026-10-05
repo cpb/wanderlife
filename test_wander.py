@@ -41,11 +41,16 @@ def test_blocked_cells_are_unoccupiable():
     assert not (born_blocked & {(3, 3)})
 
 
-def test_player_counts_as_living_cell():
-    # Player completes a blinker; the avatar itself never persists as a star.
+def test_players_count_as_living_cells():
+    # One player completes a blinker; avatars never persist as stars.
     cells = {(5, 5), (7, 5)}
-    out = wander.step_game_of_life(cells, 20, 20, player_pos=(6, 5))
+    out = wander.step_game_of_life(cells, 20, 20, player_positions={(6, 5)})
     assert out == {(6, 4), (6, 6)}, out
+    # multiple players each count as living cells
+    out2 = wander.step_game_of_life(set(), 20, 20,
+                                    player_positions={(10, 10), (11, 10),
+                                                      (10, 11), (11, 11)})
+    assert out2 == set()  # players survive the tick but never become stars
 
 
 def test_baddie_hunts_and_kills():

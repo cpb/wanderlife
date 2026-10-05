@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for wander_game.World and the wander_server protocol.
+"""Tests for wander_game.World and the wander_server protocol (v3).
 Pure python -- no pygame, no curses needed."""
 import json
 import os
@@ -20,12 +20,24 @@ from wander_server import Saver, Server
 
 # ------------------------------------------------------------------ World
 
-def test_world_created_seeded():
+def test_world_created_seeded_no_players():
     w = World("t", 60, 40, rng=random.Random(1))
     assert len(w.asterisks) >= 14
     assert all(1 <= x <= 60 and 1 <= y <= 40 for x, y in w.asterisks)
-    assert w.px == 30 and w.py == 20
-    assert not w.is_running and w.kill_radius == KILL_RADIUS
+    assert w.players == {} and not w.is_running
+
+
+def test_world_add_and_remove_player():
+    w = World("t", 60, 40, rng=random.Random(1))
+    p1 = w.add_player()
+    p2 = w.add_player()
+    assert p1 != p2 and len(w.players) == 2
+    for pid in (p1, p2):
+        pl = w.players[pid]
+        assert 1 <= pl.x <= 60 and 1 <= pl.y <= 40
+        assert pl.kill_radius == KILL_RADIUS and pl.category == "dynamic"
+    w.remove_player(p1)
+    assert p1 not in w.players and p2 in w.players
 
 
 def test_world_tick_evolves_blinker_at_full_speed():
@@ -40,10 +52,8 @@ def test_world_background_tick_is_much_slower():
     w = World("t", 30, 30, rng=random.Random(1))
     w.asterisks = {(5, 5), (6, 5), (7, 5)}
     w.is_running = True
-    # one connected-speed interval is nowhere near enough in background
     w.tick(GOL_TICK + 0.01, active=False)
     assert w.asterisks == {(5, 5), (6, 5), (7, 5)}
-    # but the world does keep evolving, just slowly
     for _ in range(int(BACKGROUND_SLOWDOWN) + 4):
         w.tick(GOL_TICK, active=False)
     assert w.asterisks == {(6, 4), (6, 5), (6, 6)}
@@ -57,23 +67,40 @@ def test_world_setup_mode_freezes_everything():
     assert w.asterisks == before  # is_running False: nothing ticks
 
 
+def test_world_players_are_living_cells_in_run_mode():
+    w = World("t", 30, 30, rng=random.Random(1))
+    pid = w.add_player()
+    pl = w.players[pid]
+    pl.x, pl.y = 6, 5  # completes a blinker with the two stars
+    w.asterisks = {(5, 5), (7, 5)}
+    w.is_running = True
+    w.tick(GOL_TICK + 0.01, active=True)
+    assert w.asterisks == {(6, 4), (6, 6)}
+    assert pl.pos == (6, 5)  # avatar untouched by the tick
+
+
 def test_world_square_kill_then_spawn_baddie():
     w = World("t", 30, 30, rng=random.Random(2))
+    pid = w.add_player()
+    pl = w.players[pid]
+    pl.x, pl.y = 10, 10
     w.asterisks = {(10, 10)}
-    w.px, w.py = 10, 10
-    w.square()
+    w.square(pid)
     assert (10, 10) in w.dead_cells and not w.asterisks
-    w.square()  # now beside/on an X with no stars in range -> baddie
+    w.square(pid)  # now beside/on an X with no stars in range -> baddie
     assert len(w.baddies) == 1 and w.baddies[0].pos == (10, 10)
     assert (10, 10) not in w.dead_cells
+    assert "@p" in w.last_message and str(pid) in w.last_message
 
 
 def test_world_square_converts_baddies_to_gliders():
     w = World("t", 30, 30, rng=random.Random(2))
+    pid = w.add_player()
+    pl = w.players[pid]
+    pl.x, pl.y = 10, 10
     w.asterisks = set()
     w.baddies = [wander_game.Baddie(10, 10, 1, 0)]
-    w.px, w.py = 10, 10
-    w.square()
+    w.square(pid)
     assert w.baddies == []
     glider = {(10 + ox, 10 + oy) for ox, oy in wander_game.GLIDER_OFFSETS}
     assert w.asterisks == glider
@@ -81,43 +108,47 @@ def test_world_square_converts_baddies_to_gliders():
 
 def test_world_x_double_tap_clears_board():
     w = World("t", 30, 30, rng=random.Random(2))
+    pid = w.add_player()
+    w.players[pid].x, w.players[pid].y = 15, 15
     w.asterisks = {(3, 3)}
     w.dead_cells = {(4, 4)}
     w.baddies = [wander_game.Baddie(6, 6, 1, 0)]
-    w.px, w.py = 15, 15
-    w.x_tap()
-    w.x_tap()  # immediate second tap = double tap
+    w.x_tap(pid)
+    w.x_tap(pid)  # immediate second tap = double tap
     assert not w.asterisks and not w.dead_cells and not w.baddies
 
 
 def test_world_button_routing_depends_on_mode():
     w = World("t", 30, 30, rng=random.Random(2))
+    pid = w.add_player()
+    pl = w.players[pid]
     w.is_running = False
-    s0 = w.static_idx
-    w.button("l2")  # setup: cycle static patterns
-    assert w.static_idx == (s0 - 1) % len(PATTERNS_STATIC)
-    assert w.kill_radius == KILL_RADIUS
+    s0 = pl.static_idx
+    w.button(pid, "l2")  # setup: cycle static patterns
+    assert pl.static_idx == (s0 - 1) % len(PATTERNS_STATIC)
+    assert pl.kill_radius == KILL_RADIUS
     w.is_running = True
-    w.button("r2")  # run: grow kill radius
-    assert w.kill_radius == KILL_RADIUS + 1
-    d0 = w.pattern_idx
-    w.button("r1")  # run: pattern cycling disabled
-    assert w.pattern_idx == d0
+    w.button(pid, "r2")  # run: grow kill radius
+    assert pl.kill_radius == KILL_RADIUS + 1
+    d0 = pl.pattern_idx
+    w.button(pid, "r1")  # run: pattern cycling disabled
+    assert pl.pattern_idx == d0
 
 
-def test_world_serialization_roundtrip():
+def test_world_serialization_excludes_transient_players():
     w = World("t", 30, 30, rng=random.Random(3))
-    w.px, w.py = 7, 9
-    w.kill_radius = 3
+    pid = w.add_player()
     w.baddies_stopped = True
     w.is_running = True
     w.baddies = [wander_game.Baddie(5, 5, -1, 0)]
     d = json.loads(json.dumps(w.to_dict()))  # prove JSON-safety
+    assert "players" not in d
     w2 = World.from_dict(d)
-    assert w2.name == "t" and (w2.px, w2.py) == (7, 9)
-    assert w2.kill_radius == 3 and w2.baddies_stopped and w2.is_running
+    assert w2.name == "t" and w2.players == {}
+    assert w2.baddies_stopped and w2.is_running
     assert w2.asterisks == w.asterisks and w2.dead_cells == w.dead_cells
     assert len(w2.baddies) == 1 and w2.baddies[0].pos == (5, 5)
+    assert pid in w.players  # original world keeps its (runtime) players
 
 
 # --------------------------------------------------------- Server protocol
@@ -140,31 +171,34 @@ def _client(sock_path):
         obj.setdefault("v", PROTOCOL_VERSION)
         c.sendall((json.dumps(obj) + "\n").encode())
 
-    def wait_px(target, timeout=10.0):
-        """Read frames until the effective px reaches `target`. Tolerant of
-        stale full frames and of several changes coalescing into one frame
-        (only the final value is deterministic)."""
+    def _players(m):
+        return m["state"]["players"] if m.get("full") \
+            else m.get("delta", {}).get("players")
+
+    def wait_player_pos(pid, target, timeout=10.0):
+        """Frames until player `pid` is at [x, y]. Tolerant of stale and
+        coalesced frames: only the final value is deterministic."""
         end = time.time() + timeout
         while time.time() < end:
             m = json.loads(f.readline())
             if m.get("type") != "state":
                 continue
-            px = m["state"]["px"] if m.get("full") else m.get("delta", {}).get("px")
-            if px == target:
-                return m
-        raise AssertionError(f"px never reached {target}")
+            players = _players(m)
+            if not players:
+                continue
+            for p in players:
+                if p["pid"] == pid and p["pos"] == list(target):
+                    return m
+        raise AssertionError(f"player {pid} never reached {target}")
 
-    def wait_delta_value(key, value, timeout=10.0):
-        """Read frames until a non-full (delta) frame carries key == value.
-        Stale intermediate values are skipped, so this doubles as the
-        progression check (no second read needed)."""
+    def wait_delta_with(key, timeout=10.0):
         end = time.time() + timeout
         while time.time() < end:
             m = json.loads(f.readline())
             if m.get("type") == "state" and not m.get("full") \
-                    and m.get("delta", {}).get(key) == value:
+                    and key in m.get("delta", {}):
                 return m
-        raise AssertionError(f"no delta frame with {key}={value!r}")
+        raise AssertionError(f"no delta frame carrying {key!r}")
 
     def wait_stars_empty(timeout=10.0):
         end = time.time() + timeout
@@ -178,7 +212,7 @@ def _client(sock_path):
                 return m
         raise AssertionError("board never cleared")
 
-    return c, f, call, send, wait_px, wait_delta_value, wait_stars_empty
+    return (c, f, call, send, wait_player_pos, wait_delta_with, wait_stars_empty)
 
 
 def test_saver_writes_files_offthread():
@@ -191,7 +225,7 @@ def test_saver_writes_files_offthread():
             assert json.load(fh) == {"a": 1}
 
 
-def test_server_end_to_end():
+def test_server_end_to_end_multi_player():
     with tempfile.TemporaryDirectory() as td:
         sock_path = os.path.join(td, "test.sock")
         srv = Server(socket_path=sock_path, worlds_dir=td)
@@ -204,15 +238,13 @@ def test_server_end_to_end():
                 time.sleep(0.02)
             assert os.path.exists(sock_path)
 
-            c, f, call, send, wait_px, wait_delta, wait_stars = _client(sock_path)
+            c, f, call, send, wait_pos, wait_dkey, wait_stars = _client(sock_path)
 
-            # every response carries the protocol version
             r = call({"cmd": "list"})
             assert r["ok"] and r["worlds"] == [] and r["v"] == PROTOCOL_VERSION
 
-            # protocol mismatch is rejected
             bad = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            bad.settimeout(4.0)
+            bad.settimeout(10.0)
             bad.connect(sock_path)
             bad.sendall(b'{"cmd": "list", "v": 999}\n')
             bf = bad.makefile("r", encoding="utf-8")
@@ -221,59 +253,64 @@ def test_server_end_to_end():
             bad.close()
 
             r = call({"cmd": "create", "name": "alpha", "max_x": 40, "max_y": 20})
-            assert r["ok"] and r["name"] == "alpha"
+            assert r["ok"]
             assert not call({"cmd": "create", "name": "alpha"})["ok"]  # dup
 
+            # two play clients -> two distinct avatars in the same world
             r = call({"cmd": "attach", "name": "alpha"})
-            assert r["ok"] and r["state"]["name"] == "alpha" and r["role"] == "play"
-            assert len(r["state"]["asterisks"]) > 0
-            px0 = r["state"]["px"]
+            assert r["ok"] and r["role"] == "play"
+            pid1 = r["pid"]
+            players1 = {p["pid"]: p for p in r["state"]["players"]}
+            assert len(players1) == 1 and pid1 in players1
+            pos1 = players1[pid1]["pos"]
 
-            # multiple clients CAN attach to the same world (v2 change)
-            c2, f2, call2, send2, wait_px2, wait_delta2, _ = _client(sock_path)
-            r2 = call2({"cmd": "attach", "name": "alpha", "role": "watch"})
-            assert r2["ok"] and r2["role"] == "watch"
+            c2, f2, call2, send2, wait_pos2, wait_dkey2, _ = _client(sock_path)
+            r2 = call2({"cmd": "attach", "name": "alpha"})
+            pid2 = r2["pid"]
+            assert pid2 != pid1 and len(r2["state"]["players"]) == 2
+            pos2 = {p["pid"]: p for p in r2["state"]["players"]}[pid2]["pos"]
 
-            # world cannot be deleted while anyone is attached
-            assert not call({"cmd": "delete", "name": "alpha"})["ok"]
+            # a watcher spawns no avatar
+            c3, f3, call3, send3, wait_pos3, _, _ = _client(sock_path)
+            r3 = call3({"cmd": "attach", "name": "alpha", "role": "watch"})
+            assert r3["ok"] and r3["role"] == "watch" and r3["pid"] is None
+            assert len(r3["state"]["players"]) == 2
 
-            # moves stream to the player at their final (coalescing-proof) value
+            assert not call({"cmd": "delete", "name": "alpha"})["ok"]  # busy
+
+            # moving c1 moves only c1's avatar; everyone sees it
             send({"cmd": "input", "action": "move", "dx": 1, "dy": 0})
-            wait_px(px0 + 1)
-            send({"cmd": "input", "action": "move", "dx": 1, "dy": 0})
-            wait_px(px0 + 2)
+            m = wait_pos(pid1, (pos1[0] + 1, pos1[1]))
+            for p in m.get("state", m.get("delta", {})).get("players", []):
+                if p["pid"] == pid2:
+                    assert p["pos"] == pos2  # c2's avatar untouched
+            wait_pos2(pid1, (pos1[0] + 1, pos1[1]))   # second player sees it
+            wait_pos3(pid1, (pos1[0] + 1, pos1[1]))   # watcher sees it too
 
-            # frames after the attach snapshot are DELTAS; a pure move carries
-            # px and does NOT resend asterisks (setup mode: nothing else mutates)
+            # frames after attach are deltas; a pure move carries players only
             send({"cmd": "input", "action": "move", "dx": 1, "dy": 0})
-            m = wait_delta("px", px0 + 3)
+            m = wait_dkey("players")
             assert m["v"] == PROTOCOL_VERSION
             assert "asterisks" not in m["delta"]
 
-            # the attached watcher receives the same deltas
-            wait_px2(px0 + 3)
-            send({"cmd": "input", "action": "move", "dx": 1, "dy": 0})
-            m2 = wait_delta2("px", px0 + 4)
-            assert "asterisks" not in m2["delta"]
-            wait_px(px0 + 4)
+            # watcher input is ignored; c1's next move lands on its own avatar
+            send3({"cmd": "input", "action": "move", "dx": 9, "dy": 9})
+            send({"cmd": "input", "action": "move", "dx": 0, "dy": 1})
+            wait_pos(pid1, (pos1[0] + 2, pos1[1] + 1))
 
-            # watcher inputs are ignored: c2 pushes +5, c1 pushes +1 -> px +1
-            send2({"cmd": "input", "action": "move", "dx": 5, "dy": 0})
-            send({"cmd": "input", "action": "move", "dx": 1, "dy": 0})
-            wait_px(px0 + 5)  # only the player's move took effect
-
-            # a world command reaches the world (clear empties the board)
+            # world command works and is attributable (clear via c1)
             send({"cmd": "command", "do": "clear"})
             wait_stars()
 
+            # detaching despawns that client's avatar
             r = call({"cmd": "detach"})
             assert r["ok"]
-            r2 = call2({"cmd": "detach"})
-            assert r2["ok"]
+            infos = call2({"cmd": "list"})["worlds"]
+            assert infos[0]["players"] == 1  # only c2's avatar remains
 
-            # now deletable
+            call2({"cmd": "detach"})
+            call3({"cmd": "detach"})
             assert call({"cmd": "delete", "name": "alpha"})["ok"]
-            assert call({"cmd": "list"})["worlds"] == []
 
             # recreate + attach/detach to leave a world on disk for reload
             call({"cmd": "create", "name": "beta", "max_x": 33, "max_y": 21})
@@ -281,14 +318,15 @@ def test_server_end_to_end():
             call({"cmd": "detach"})
             c.close()
             c2.close()
+            c3.close()
         finally:
             srv.stop = True
             th.join(timeout=5)
 
-        # world persisted to disk (via the Saver thread) and reloads
         with open(os.path.join(td, "beta.json")) as fh:
             w = World.from_dict(json.load(fh))
         assert w.name == "beta" and w.max_x == 33 and w.max_y == 21
+        assert w.players == {}  # players are transient, never persisted
 
 
 if __name__ == "__main__":

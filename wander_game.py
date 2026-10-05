@@ -2,10 +2,10 @@
 no curses). Used by wander.py (standalone game), wander_server.py (headless
 game server) and the test suite.
 
-A World is one persistent Game-of-Life board with its own player avatar,
-baddies, pattern selection and tuning-driven rules. Worlds tick at full
-speed while a client is attached and BACKGROUND_SLOWDOWN times slower
-when nobody is watching.
+A World is one persistent Game-of-Life board plus any number of transient
+Players (one per attached play-client; they spawn on attach and despawn on
+detach). Worlds tick at full speed while a client is attached and
+BACKGROUND_SLOWDOWN times slower when nobody is watching.
 """
 import random
 import time
@@ -22,7 +22,7 @@ SEED_FORMS = 7           # forms scattered at startup / on "Seed new life"
 GOL_TICK = 0.4           # seconds between Game of Life steps when running
 BACKGROUND_SLOWDOWN = 20.0  # idle (clientless) worlds tick this many times slower
 
-PROTOCOL_VERSION = 2     # client/server protocol; bumped on breaking changes
+PROTOCOL_VERSION = 3     # client/server protocol; bumped on breaking changes
 
 PATTERNS_OSCILLATORS = [
     ("Single Star", [(0, 0)]),
@@ -47,12 +47,12 @@ GLIDER_OFFSETS = dict(ALL_PATTERNS)["Glider"]
 
 # ---------------------------------------------------------------- Game logic
 
-def step_game_of_life(asterisks, max_x, max_y, blocked=frozenset(), player_pos=None):
+def step_game_of_life(asterisks, max_x, max_y, blocked=frozenset(),
+                      player_positions=frozenset()):
     """One Conway tick. `blocked` cells are unoccupiable: no births and no
-    survivals there. player_pos counts as a living cell for the tick."""
-    active_cells = set(asterisks)
-    if player_pos:
-        active_cells.add(player_pos)
+    survivals there. Every cell in `player_positions` counts as a living
+    cell for the tick (avatars never persist as stars themselves)."""
+    active_cells = set(asterisks) | set(player_positions)
 
     neighbor_counts = {}
     for (x, y) in active_cells:
@@ -74,7 +74,7 @@ def step_game_of_life(asterisks, max_x, max_y, blocked=frozenset(), player_pos=N
             next_asterisks.add(pos)
 
     next_asterisks.difference_update(blocked)
-    next_asterisks.discard(player_pos)
+    next_asterisks.difference_update(player_positions)
     return next_asterisks
 
 
@@ -261,14 +261,37 @@ def update_baddies(baddies, asterisks, dead_cells, max_x, max_y, rng=None,
     return decayed, crowded
 
 
+# ------------------------------------------------------------------- Player
+
+class Player:
+    """One '@': a transient avatar spawned per attached play-client.
+    Position, kill radius and pattern selection are per-player."""
+    __slots__ = ("pid", "x", "y", "kill_radius", "category",
+                 "pattern_idx", "static_idx", "last_x_tap")
+
+    def __init__(self, pid, x, y):
+        self.pid = pid
+        self.x, self.y = x, y
+        self.kill_radius = KILL_RADIUS
+        self.category = "dynamic"
+        self.pattern_idx = 0
+        self.static_idx = 0
+        self.last_x_tap = 0.0
+
+    @property
+    def pos(self):
+        return (self.x, self.y)
+
+
 # -------------------------------------------------------------------- World
 
 class World:
-    """One persistent game world: board, entities, player, rules and clocks.
+    """One persistent game world: board, entities, players, rules, clocks.
 
     The server ticks worlds at full speed while a client is attached and
-    BACKGROUND_SLOWDOWN times slower otherwise. All state is JSON
-    serializable via to_dict()/from_dict().
+    BACKGROUND_SLOWDOWN times slower otherwise. Persistent state is JSON
+    serializable via to_dict()/from_dict(); players are transient and are
+    NOT persisted (they belong to connections, not to the world file).
     """
 
     def __init__(self, name, max_x, max_y, rng=None):
@@ -279,16 +302,12 @@ class World:
         self.asterisks = set()
         self.dead_cells = set()
         self.baddies = []
-        self.px, self.py = self.max_x // 2, self.max_y // 2
+        self.players = {}          # pid -> Player (transient)
+        self.next_pid = 0
         self.is_running = False
         self.baddies_stopped = False
-        self.kill_radius = KILL_RADIUS
-        self.pattern_idx = 0
-        self.static_idx = 0
-        self.category = "dynamic"
         self.gol_clock = 0.0
         self.baddie_clock = 0.0
-        self.last_x_tap = 0.0
         self.last_message = ""
         self.message_time = 0.0
         self.created = datetime.now().isoformat(timespec="seconds")
@@ -300,15 +319,43 @@ class World:
     def _touch(self):
         self.rev += 1
 
+    def _prefix(self, pid):
+        return f"@p{pid}: " if pid is not None else ""
+
     def flash(self, text):
         self.last_message = text
         self.message_time = time.time()
         self._touch()
 
-    def current_pattern(self):
-        if self.category == "dynamic":
-            return PATTERNS_OSCILLATORS[self.pattern_idx]
-        return PATTERNS_STATIC[self.static_idx]
+    def current_pattern(self, pid):
+        p = self.players[pid]
+        if p.category == "dynamic":
+            return PATTERNS_OSCILLATORS[p.pattern_idx]
+        return PATTERNS_STATIC[p.static_idx]
+
+    # ------------------------------------------------------------ players
+    def add_player(self):
+        """Spawn a new player at a random free-ish spot. Returns its pid."""
+        self.next_pid += 1
+        pid = self.next_pid
+        taken = {p.pos for p in self.players.values()}
+        x, y = self.max_x // 2, self.max_y // 2
+        for _ in range(20):
+            cx = self.rng.randint(max(2, self.max_x // 6),
+                                  max(2, self.max_x - self.max_x // 6))
+            cy = self.rng.randint(max(2, self.max_y // 6),
+                                  max(2, self.max_y - self.max_y // 6))
+            if (cx, cy) not in taken:
+                x, y = cx, cy
+                break
+        self.players[pid] = Player(pid, x, y)
+        self.flash(f"@p{pid} joined")
+        return pid
+
+    def remove_player(self, pid):
+        if pid in self.players:
+            del self.players[pid]
+            self.flash(f"@p{pid} left")
 
     # ------------------------------------------------------------ ticking
     def tick(self, dt, active=True):
@@ -321,7 +368,8 @@ class World:
                 self.gol_clock = 0.0
                 self.asterisks = step_game_of_life(
                     self.asterisks, self.max_x, self.max_y,
-                    blocked=self.dead_cells, player_pos=(self.px, self.py))
+                    blocked=self.dead_cells,
+                    player_positions={p.pos for p in self.players.values()})
                 self._touch()
             if self.baddies and not self.baddies_stopped:
                 self.baddie_clock += dt
@@ -344,27 +392,30 @@ class World:
                                    " (too crowded)")
         self.tick_count += 1
 
-    # ------------------------------------------------------------ actions
-    def move(self, dx, dy):
-        nx = max(1, min(self.max_x, self.px + int(dx)))
-        ny = max(1, min(self.max_y, self.py + int(dy)))
-        if (nx, ny) != (self.px, self.py):
-            self.px, self.py = nx, ny
+    # ------------------------------------------------------ player actions
+    def move(self, pid, dx, dy):
+        p = self.players.get(pid)
+        if p is None:
+            return
+        nx = max(1, min(self.max_x, p.x + int(dx)))
+        ny = max(1, min(self.max_y, p.y + int(dy)))
+        if (nx, ny) != p.pos:
+            p.x, p.y = nx, ny
             self._touch()
 
-    def toggle_run(self):
-        self.is_running = not self.is_running
-        self._touch()
-
-    def square(self):
-        """Kill stars in the area, convert baddies to gliders, or -- when
-        nothing is in range -- spawn a baddie from a nearby X."""
-        killed = kill_area(self.px, self.py, self.kill_radius,
+    def square(self, pid):
+        """Kill stars in the player's area, convert baddies to gliders, or
+        -- when nothing is in range -- spawn a baddie from a nearby X."""
+        p = self.players.get(pid)
+        if p is None:
+            return
+        killed = kill_area(p.x, p.y, p.kill_radius,
                            self.asterisks, self.dead_cells,
                            self.max_x, self.max_y)
-        converted = baddies_to_gliders(self.px, self.py, self.kill_radius,
+        converted = baddies_to_gliders(p.x, p.y, p.kill_radius,
                                        self.baddies, self.asterisks,
                                        self.dead_cells, self.max_x, self.max_y)
+        pre = self._prefix(pid)
         if killed or converted:
             parts = []
             if killed:
@@ -372,129 +423,152 @@ class World:
             if converted:
                 parts.append(f"{converted} baddie{'s' if converted > 1 else ''}"
                              f" -> glider{'s' if converted > 1 else ''}")
-            self.flash("; ".join(parts))
+            self.flash(pre + "; ".join(parts))
             return
-        sr = max(1, self.kill_radius)
-        near = [(self.px + ox, self.py + oy)
+        sr = max(1, p.kill_radius)
+        near = [(p.x + ox, p.y + oy)
                 for oy in range(-sr, sr + 1) for ox in range(-sr, sr + 1)
-                if (self.px + ox, self.py + oy) in self.dead_cells]
+                if (p.x + ox, p.y + oy) in self.dead_cells]
         if near:
-            t = min(near, key=lambda c: abs(c[0] - self.px) + abs(c[1] - self.py))
+            t = min(near, key=lambda c: abs(c[0] - p.x) + abs(c[1] - p.y))
             self.dead_cells.discard(t)
             self.baddies.append(Baddie(t[0], t[1],
                                        self.rng.choice((-1, 0, 1)),
                                        self.rng.choice((-1, 0, 1))))
-            self.flash("Baddie spawned! It hunts stars.")
+            self.flash(pre + "Baddie spawned! It hunts stars.")
         else:
-            self.flash("Stand on * to kill it, or beside X to spawn a baddie")
+            self.flash(pre + "Stand on * to kill it, or beside X to spawn a baddie")
 
-    def x_tap(self):
+    def x_tap(self, pid):
         """Double-tap clears the board; single tap erases/reclaims/neutralizes."""
+        p = self.players.get(pid)
+        if p is None:
+            return
+        pre = self._prefix(pid)
         now = time.time()
-        if now - self.last_x_tap < DOUBLE_TAP_TIME:
-            self.last_x_tap = 0.0
+        if now - p.last_x_tap < DOUBLE_TAP_TIME:
+            p.last_x_tap = 0.0
             self.asterisks.clear()
             self.dead_cells.clear()
             self.baddies.clear()
-            self.flash("Board cleared (double-tap X)")
+            self.flash(pre + "Board cleared (double-tap X)")
             return
-        self.last_x_tap = now
-        p = (self.px, self.py)
-        if p in self.asterisks:
-            self.asterisks.discard(p)
-            self.flash("Star erased")
-        elif p in self.dead_cells:
-            self.dead_cells.discard(p)
-            self.flash("Cell reclaimed")
+        p.last_x_tap = now
+        if p.pos in self.asterisks:
+            self.asterisks.discard(p.pos)
+            self.flash(pre + "Star erased")
+        elif p.pos in self.dead_cells:
+            self.dead_cells.discard(p.pos)
+            self.flash(pre + "Cell reclaimed")
         else:
-            hit = next((i for i, b in enumerate(self.baddies) if b.pos == p), None)
+            hit = next((i for i, b in enumerate(self.baddies) if b.pos == p.pos),
+                       None)
             if hit is not None:
                 del self.baddies[hit]
-                self.dead_cells.add(p)
-                self.flash("Baddie neutralized -> X")
+                self.dead_cells.add(p.pos)
+                self.flash(pre + "Baddie neutralized -> X")
 
-    def toggle_baddies(self):
-        self.baddies_stopped = not self.baddies_stopped
-        self.flash("Baddies stopped" if self.baddies_stopped
-                   else "Baddies unleashed")
-
-    def adjust_radius(self, delta):
-        if not self.is_running:
-            return
-        new = min(max(self.kill_radius + int(delta), 0), MAX_KILL_RADIUS)
-        if new != self.kill_radius:
-            self.kill_radius = new
-            self.flash(f"Kill area: {2 * new + 1}x{2 * new + 1}")
-
-    def cycle(self, category, direction):
+    def cycle(self, pid, category, direction):
         if self.is_running:
             return
-        self.category = category
+        p = self.players.get(pid)
+        if p is None:
+            return
+        p.category = category
         if category == "dynamic":
-            self.pattern_idx = (self.pattern_idx + direction) % len(PATTERNS_OSCILLATORS)
+            p.pattern_idx = (p.pattern_idx + direction) % len(PATTERNS_OSCILLATORS)
         else:
-            self.static_idx = (self.static_idx + direction) % len(PATTERNS_STATIC)
+            p.static_idx = (p.static_idx + direction) % len(PATTERNS_STATIC)
+        self._touch()
 
-    def set_pattern(self, idx):
+    def set_pattern(self, pid, idx):
+        p = self.players.get(pid)
+        if p is None:
+            return
         idx = int(idx)
         if 0 <= idx < len(PATTERNS_OSCILLATORS):
-            self.category, self.pattern_idx = "dynamic", idx
+            p.category, p.pattern_idx = "dynamic", idx
         elif len(PATTERNS_OSCILLATORS) <= idx < len(ALL_PATTERNS):
-            self.category = "static"
-            self.static_idx = idx - len(PATTERNS_OSCILLATORS)
+            p.category = "static"
+            p.static_idx = idx - len(PATTERNS_OSCILLATORS)
         else:
             return
         self.is_running = False
-        self.flash(f"Active shape: {ALL_PATTERNS[idx][0]}")
+        self.flash(self._prefix(pid) + f"Active shape: {ALL_PATTERNS[idx][0]}")
 
-    def stamp(self):
+    def stamp(self, pid):
         if self.is_running:
             return
-        _, offsets = self.current_pattern()
+        p = self.players.get(pid)
+        if p is None:
+            return
+        _, offsets = self.current_pattern(pid)
         placed = 0
         for ox, oy in offsets:
-            t = (self.px + ox, self.py + oy)
+            t = (p.x + ox, p.y + oy)
             if (1 <= t[0] <= self.max_x and 1 <= t[1] <= self.max_y
                     and t not in self.dead_cells):
                 self.asterisks.add(t)
                 placed += 1
+        self._touch()
         if placed < len(offsets):
-            self.flash("Some cells blocked by X")
+            self.flash(self._prefix(pid) + "Some cells blocked by X")
 
-    def seed(self):
+    def adjust_radius(self, pid, delta):
+        if not self.is_running:
+            return
+        p = self.players.get(pid)
+        if p is None:
+            return
+        new = min(max(p.kill_radius + int(delta), 0), MAX_KILL_RADIUS)
+        if new != p.kill_radius:
+            p.kill_radius = new
+            self.flash(self._prefix(pid) + f"Kill area: {2 * new + 1}x{2 * new + 1}")
+
+    # ------------------------------------------------------- world actions
+    def toggle_run(self, pid=None):
+        self.is_running = not self.is_running
+        self._touch()
+
+    def toggle_baddies(self, pid=None):
+        self.baddies_stopped = not self.baddies_stopped
+        self.flash(self._prefix(pid) + ("Baddies stopped" if self.baddies_stopped
+                                        else "Baddies unleashed"))
+
+    def seed(self, pid=None):
         seed_board(self.asterisks, self.max_x, self.max_y, self.rng)
-        self.flash("Seeded new life")
+        self.flash(self._prefix(pid) + "Seeded new life")
 
-    def clear(self):
+    def clear(self, pid=None):
         self.asterisks.clear()
         self.dead_cells.clear()
         self.baddies.clear()
-        self.flash("Board cleared")
+        self.flash(self._prefix(pid) + "Board cleared")
 
-    def button(self, name):
-        """Route a controller button by name (mode-aware)."""
+    def button(self, pid, name):
+        """Route a controller button by name for a player (mode-aware)."""
         if name == "square":
-            self.square()
+            self.square(pid)
         elif name == "x":
-            self.x_tap()
+            self.x_tap(pid)
         elif name == "circle":
-            self.stamp()
+            self.stamp(pid)
         elif name == "triangle":
-            self.toggle_run()
+            self.toggle_run(pid)
         elif name == "l1":
-            self.cycle("dynamic", -1)
+            self.cycle(pid, "dynamic", -1)
         elif name == "r1":
-            self.cycle("dynamic", 1)
+            self.cycle(pid, "dynamic", 1)
         elif name == "l2":
             if self.is_running:
-                self.adjust_radius(-1)
+                self.adjust_radius(pid, -1)
             else:
-                self.cycle("static", -1)
+                self.cycle(pid, "static", -1)
         elif name == "r2":
             if self.is_running:
-                self.adjust_radius(1)
+                self.adjust_radius(pid, 1)
             else:
-                self.cycle("static", 1)
+                self.cycle(pid, "static", 1)
 
     # ------------------------------------------------------ serialization
     def info(self):
@@ -503,6 +577,7 @@ class World:
             "stars": len(self.asterisks),
             "xs": len(self.dead_cells),
             "baddies": len(self.baddies),
+            "players": len(self.players),
             "running": self.is_running,
             "created": self.created,
             "ticks": self.tick_count,
@@ -510,35 +585,42 @@ class World:
 
     def client_state(self):
         """Everything a client needs to render one frame (JSON-safe)."""
-        name, offsets = self.current_pattern()
+        players = []
+        for p in self.players.values():
+            pname, poffsets = (PATTERNS_OSCILLATORS[p.pattern_idx]
+                               if p.category == "dynamic"
+                               else PATTERNS_STATIC[p.static_idx])
+            players.append({
+                "pid": p.pid,
+                "pos": [p.x, p.y],
+                "kill_radius": p.kill_radius,
+                "category": p.category,
+                "pattern_name": pname,
+                "pattern_offsets": poffsets,
+            })
         return {
             "name": self.name,
             "max_x": self.max_x,
             "max_y": self.max_y,
-            "px": self.px,
-            "py": self.py,
             "asterisks": sorted(list(p) for p in self.asterisks),
             "dead_cells": sorted(list(p) for p in self.dead_cells),
             "baddies": [{"pos": [b.x, b.y], "dir": [b.dx, b.dy]}
                         for b in self.baddies],
+            "players": players,
             "is_running": self.is_running,
             "baddies_stopped": self.baddies_stopped,
-            "kill_radius": self.kill_radius,
-            "category": self.category,
-            "pattern_name": name,
-            "pattern_offsets": offsets,
             "last_message": self.last_message,
             "message_time": self.message_time,
         }
 
     def to_dict(self):
+        """Persistent state only -- players are transient and excluded."""
         d = self.client_state()
+        del d["players"]
         d.update({
             "version": 1,
             "created": self.created,
             "tick_count": self.tick_count,
-            "pattern_idx": self.pattern_idx,
-            "static_idx": self.static_idx,
         })
         return d
 
@@ -562,19 +644,12 @@ class World:
             by = min(max(int(bd["pos"][1]), 1), w.max_y)
             bdx, bdy = (bd.get("dir") or [1, 0])[:2]
             w.baddies.append(Baddie(bx, by, int(bdx), int(bdy)))
-        w.px = min(max(int(st.get("px", w.max_x // 2)), 1), w.max_x)
-        w.py = min(max(int(st.get("py", w.max_y // 2)), 1), w.max_y)
+        w.players = {}
+        w.next_pid = 0
         w.is_running = bool(st.get("is_running", False))
         w.baddies_stopped = bool(st.get("baddies_stopped", False))
-        w.kill_radius = min(max(int(st.get("kill_radius", KILL_RADIUS)), 0),
-                            MAX_KILL_RADIUS)
-        w.category = st.get("category") if st.get("category") in ("dynamic", "static") \
-            else "dynamic"
-        w.pattern_idx = int(st.get("pattern_idx", 0)) % len(PATTERNS_OSCILLATORS)
-        w.static_idx = int(st.get("static_idx", 0)) % len(PATTERNS_STATIC)
         w.gol_clock = 0.0
         w.baddie_clock = 0.0
-        w.last_x_tap = 0.0
         w.last_message = str(st.get("last_message", ""))
         w.message_time = 0.0
         w.created = str(st.get("created",
