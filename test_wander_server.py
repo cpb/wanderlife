@@ -140,15 +140,45 @@ def _client(sock_path):
         obj.setdefault("v", PROTOCOL_VERSION)
         c.sendall((json.dumps(obj) + "\n").encode())
 
-    def wait_frame(pred, timeout=10.0):
+    def wait_px(target, timeout=10.0):
+        """Read frames until the effective px reaches `target`. Tolerant of
+        stale full frames and of several changes coalescing into one frame
+        (only the final value is deterministic)."""
         end = time.time() + timeout
         while time.time() < end:
             m = json.loads(f.readline())
-            if m.get("type") == "state" and pred(m):
+            if m.get("type") != "state":
+                continue
+            px = m["state"]["px"] if m.get("full") else m.get("delta", {}).get("px")
+            if px == target:
                 return m
-        raise AssertionError("no matching frame")
+        raise AssertionError(f"px never reached {target}")
 
-    return c, f, call, send, wait_frame
+    def wait_delta_value(key, value, timeout=10.0):
+        """Read frames until a non-full (delta) frame carries key == value.
+        Stale intermediate values are skipped, so this doubles as the
+        progression check (no second read needed)."""
+        end = time.time() + timeout
+        while time.time() < end:
+            m = json.loads(f.readline())
+            if m.get("type") == "state" and not m.get("full") \
+                    and m.get("delta", {}).get(key) == value:
+                return m
+        raise AssertionError(f"no delta frame with {key}={value!r}")
+
+    def wait_stars_empty(timeout=10.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            m = json.loads(f.readline())
+            if m.get("type") != "state":
+                continue
+            ast = m["state"]["asterisks"] if m.get("full") \
+                else m.get("delta", {}).get("asterisks")
+            if ast == []:
+                return m
+        raise AssertionError("board never cleared")
+
+    return c, f, call, send, wait_px, wait_delta_value, wait_stars_empty
 
 
 def test_saver_writes_files_offthread():
@@ -174,7 +204,7 @@ def test_server_end_to_end():
                 time.sleep(0.02)
             assert os.path.exists(sock_path)
 
-            c, f, call, send, wait_frame = _client(sock_path)
+            c, f, call, send, wait_px, wait_delta, wait_stars = _client(sock_path)
 
             # every response carries the protocol version
             r = call({"cmd": "list"})
@@ -200,38 +230,41 @@ def test_server_end_to_end():
             px0 = r["state"]["px"]
 
             # multiple clients CAN attach to the same world (v2 change)
-            c2, f2, call2, send2, wait_frame2 = _client(sock_path)
+            c2, f2, call2, send2, wait_px2, wait_delta2, _ = _client(sock_path)
             r2 = call2({"cmd": "attach", "name": "alpha", "role": "watch"})
             assert r2["ok"] and r2["role"] == "watch"
 
             # world cannot be deleted while anyone is attached
             assert not call({"cmd": "delete", "name": "alpha"})["ok"]
 
-            # first streamed frame for each client is a FULL frame
+            # moves stream to the player at their final (coalescing-proof) value
             send({"cmd": "input", "action": "move", "dx": 1, "dy": 0})
-            m = wait_frame(lambda m: m.get("full") and m["state"]["px"] == px0 + 1)
+            wait_px(px0 + 1)
+            send({"cmd": "input", "action": "move", "dx": 1, "dy": 0})
+            wait_px(px0 + 2)
+
+            # frames after the attach snapshot are DELTAS; a pure move carries
+            # px and does NOT resend asterisks (setup mode: nothing else mutates)
+            send({"cmd": "input", "action": "move", "dx": 1, "dy": 0})
+            m = wait_delta("px", px0 + 3)
             assert m["v"] == PROTOCOL_VERSION
-            wait_frame2(lambda m: m.get("full"))
-
-            # second change arrives as a DELTA: px changed, asterisks omitted
-            send({"cmd": "input", "action": "move", "dx": 1, "dy": 0})
-            m = wait_frame(lambda m: not m.get("full") and "px" in m.get("delta", {}))
-            assert m["delta"]["px"] == px0 + 2
             assert "asterisks" not in m["delta"]
-            # the watcher gets the same delta
-            m2 = wait_frame2(lambda m: not m.get("full") and "px" in m.get("delta", {}))
-            assert m2["delta"]["px"] == px0 + 2
 
-            # watcher inputs are ignored: c2 moves +5, then c1 moves +1
+            # the attached watcher receives the same deltas
+            wait_px2(px0 + 3)
+            send({"cmd": "input", "action": "move", "dx": 1, "dy": 0})
+            m2 = wait_delta2("px", px0 + 4)
+            assert "asterisks" not in m2["delta"]
+            wait_px(px0 + 4)
+
+            # watcher inputs are ignored: c2 pushes +5, c1 pushes +1 -> px +1
             send2({"cmd": "input", "action": "move", "dx": 5, "dy": 0})
             send({"cmd": "input", "action": "move", "dx": 1, "dy": 0})
-            m = wait_frame(lambda m: not m.get("full") and "px" in m.get("delta", {}))
-            assert m["delta"]["px"] == px0 + 3  # only the player's move
+            wait_px(px0 + 5)  # only the player's move took effect
 
             # a world command reaches the world (clear empties the board)
             send({"cmd": "command", "do": "clear"})
-            wait_frame(lambda m: not m.get("full")
-                       and m.get("delta", {}).get("asterisks") == [])
+            wait_stars()
 
             r = call({"cmd": "detach"})
             assert r["ok"]
@@ -242,7 +275,7 @@ def test_server_end_to_end():
             assert call({"cmd": "delete", "name": "alpha"})["ok"]
             assert call({"cmd": "list"})["worlds"] == []
 
-            # recreate + detach to leave a world on disk for the reload check
+            # recreate + attach/detach to leave a world on disk for reload
             call({"cmd": "create", "name": "beta", "max_x": 33, "max_y": 21})
             call({"cmd": "attach", "name": "beta"})
             call({"cmd": "detach"})

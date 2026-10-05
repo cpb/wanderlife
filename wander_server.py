@@ -223,13 +223,15 @@ class Server:
                     role = msg.get("role", "play")
                     if role not in ("play", "watch"):
                         role = "play"
+                    # The attach response doubles as the client's full
+                    # frame; streamed frames are deltas from here on.
+                    st = w.client_state()
                     self.attached[conn] = {"name": name, "role": role,
-                                           "sent_rev": -1, "last": {},
-                                           "last_send": 0.0}
+                                           "sent_rev": w.rev, "last": st,
+                                           "last_send": time.time()}
                     print(f"client attached to {name!r} as {role} "
                           f"({self.online_count(name)} online)", flush=True)
-                    self.send(conn, {"ok": True, "role": role,
-                                     "state": w.client_state()})
+                    self.send(conn, {"ok": True, "role": role, "state": st})
 
             elif cmd == "detach":
                 entry = self.attached.pop(conn, None)
