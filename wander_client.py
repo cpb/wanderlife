@@ -6,7 +6,8 @@ world, or delete one. Multiple clients can attach to the same world --
 several players share the one '@' (chaos is a feature), or attach with
 the watch role to just observe.
 
-Input: a paired PS3 controller if present, otherwise the keyboard:
+Input: a paired PS3 controller and the keyboard both work at the same
+time (if no controller is detected the client is keyboard-only).
 
   move            arrows / hjkl / wasd
   SQUARE kill     SPACE          X erase       x
@@ -59,7 +60,7 @@ KEYMAP = {
     "select": {27, ord("m")},   # ESC or m
     "start": {27},
     "confirm": {curses.KEY_ENTER, 10, 13},
-    "watch": {ord("w")},
+    "watch": {ord("v")},
 }
 
 # Logical buttons forwarded to the world as game actions
@@ -99,7 +100,9 @@ class PadInput:
         return dx, dy
 
     def _down(self, name):
-        btn = PAD_BUTTONS[name]
+        btn = PAD_BUTTONS.get(name)
+        if btn is None:
+            return False
         return btn < self.js.get_numbuttons() and self.js.get_button(btn)
 
     def edge(self, name):
@@ -115,6 +118,31 @@ class PadInput:
             if not any(self.js.get_button(i) for i in range(self.js.get_numbuttons())):
                 return
             time.sleep(0.02)
+
+
+class CombinedInput:
+    """PS3 controller and keyboard at the same time: either one drives."""
+    kind = "combined"
+
+    def __init__(self, stdscr):
+        self.pad = PadInput()
+        self.keys = KeyInput(stdscr)
+
+    def pump(self):
+        self.pad.pump()
+        self.keys.pump()
+
+    def nav(self):
+        dx, dy = self.pad.nav()
+        if dx == 0 and dy == 0:
+            dx, dy = self.keys.nav()
+        return dx, dy
+
+    def edge(self, name):
+        return self.pad.edge(name) or self.keys.edge(name)
+
+    def release_sync(self):
+        self.pad.release_sync()
 
 
 class KeyInput:
@@ -241,8 +269,7 @@ def run_menu(stdscr, inp, sw, sh, title, items,
             move_cd = now
             sel = (sel + (1 if dy > 0 else -1)) % len(items)
 
-        if (inp.edge("x") or inp.edge("circle")
-                or (inp.kind == "keys" and inp.edge("confirm"))):
+        if inp.edge("x") or inp.edge("circle") or inp.edge("confirm"):
             inp.release_sync()
             return items[sel][0]
         if inp.edge("select") or inp.edge("start"):
@@ -284,8 +311,7 @@ def run_gallery_menu(stdscr, inp, sw, sh):
             move_cd = now
             sel = (sel + (1 if nav > 0 else -1)) % len(ALL_PATTERNS)
 
-        if (inp.edge("x") or inp.edge("circle")
-                or (inp.kind == "keys" and inp.edge("confirm"))):
+        if inp.edge("x") or inp.edge("circle") or inp.edge("confirm"):
             inp.release_sync()
             return sel
         if inp.edge("select") or inp.edge("start"):
@@ -343,7 +369,7 @@ def next_world_name(worlds):
 
 def pick_world(stdscr, inp, conn, sw, sh):
     """World menu: play / create / watch / delete.
-    Returns ("play", state, role) or ("quit", None, None)."""
+    Returns ("play", state, role, pid) or ("quit", None, None, None)."""
     inp.release_sync()
     sel = 0
     move_cd = time.time()
@@ -378,15 +404,14 @@ def pick_world(stdscr, inp, conn, sw, sh):
         def attach(role):
             r = conn.rpc({"cmd": "attach", "name": choice, "role": role})
             if r.get("ok"):
-                return ("play", r["state"], r.get("role", role))
+                return ("play", r["state"], r.get("role", role), r.get("pid"))
             raise ConnectionError(r.get("error", "attach failed"))
 
-        if (inp.edge("x") or inp.edge("circle")
-                or (inp.kind == "keys" and inp.edge("confirm"))):
+        if inp.edge("x") or inp.edge("circle") or inp.edge("confirm"):
             inp.release_sync()
             dirty = True
             if choice == "Quit":
-                return ("quit", None, None)
+                return ("quit", None, None, None)
             try:
                 if choice == "+ Create new world":
                     r = conn.rpc({"cmd": "create", "name": next_world_name(worlds),
@@ -399,7 +424,7 @@ def pick_world(stdscr, inp, conn, sw, sh):
             except (ConnectionError, OSError, ValueError) as e:
                 flash, flash_until = f"attach failed: {e}", now + 4.0
 
-        watch_edge = inp.edge("triangle") or (inp.kind == "keys" and inp.edge("watch"))
+        watch_edge = inp.edge("triangle") or inp.edge("watch")
         if watch_edge and choice not in ("+ Create new world", "Quit"):
             inp.release_sync()
             dirty = True
@@ -431,7 +456,8 @@ def pick_world(stdscr, inp, conn, sw, sh):
         stdscr.border(0, 0, 0, 0, 0, 0, 0, 0)
         stdscr.attroff(attr)
         safe_addstr(stdscr, 0, 4, " WANDER WORLDS ", attr)
-        mode = "PS3 controller" if inp.kind == "pad" else "keyboard"
+        mode = {"pad": "PS3 controller", "keys": "keyboard",
+                "combined": "PS3 controller + keyboard"}[inp.kind]
         safe_addstr(stdscr, 1, 4, f"server: {SOCKET_PATH}   input: {mode}",
                     curses.color_pair(3))
 
@@ -452,7 +478,7 @@ def pick_world(stdscr, inp, conn, sw, sh):
             line_attr = (curses.color_pair(1) | curses.A_BOLD) if i == sel else curses.color_pair(3)
             safe_addstr(stdscr, y0 + i, 6, ("-> " if i == sel else "   ") + items[i], line_attr)
 
-        hint = "X/ENTER: play   TRIANGLE/w: watch   SQUARE x2: delete"
+        hint = "X/ENTER: play   TRIANGLE/v: watch   SQUARE x2: delete"
         safe_addstr(stdscr, sh - 2, max(2, (sw - len(hint)) // 2), hint, curses.color_pair(2))
         if now < flash_until:
             safe_addstr(stdscr, sh - 1, max(1, sw - len(flash) - 3), flash,
@@ -643,14 +669,15 @@ def play_world(stdscr, inp, conn, state, sw, sh, role, my_pid):
             if inp.edge("r3"):
                 conn.send({"cmd": "command", "do": "stop_baddies"})
 
-        render_state(stdscr, state, ast_set, dead_set, pred_x, pred_y, sw, sh, role)
+        render_state(stdscr, state, ast_set, dead_set, my,
+                     (pred_x, pred_y), sw, sh, role)
         time.sleep(0.02)
 
 
 # -------------------------------------------------------------------- Main
 
 def main(stdscr):
-    # Input: PS3 controller if present, keyboard otherwise
+    # Input: PS3 controller and keyboard together; keyboard-only if no pad
     pygame.init()
     pygame.joystick.init()
     have_pad = pygame.joystick.get_count() > 0
@@ -672,7 +699,7 @@ def main(stdscr):
     sh, sw = stdscr.getmaxyx()
 
     if have_pad:
-        inp = PadInput()
+        inp = CombinedInput(stdscr)  # controller AND keyboard both live
     else:
         inp = KeyInput(stdscr)
 
@@ -690,10 +717,10 @@ def main(stdscr):
         return
 
     while True:
-        outcome, payload, role = pick_world(stdscr, inp, conn, sw, sh)
+        outcome, payload, role, pid = pick_world(stdscr, inp, conn, sw, sh)
         if outcome == "quit":
             break
-        result = play_world(stdscr, inp, conn, payload, sw, sh, role)
+        result = play_world(stdscr, inp, conn, payload, sw, sh, role, pid)
         if result == "quit":
             break
         if result == "lost":
