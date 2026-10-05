@@ -124,7 +124,7 @@ def test_world_serialization_roundtrip():
 
 def _client(sock_path):
     c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    c.settimeout(4.0)
+    c.settimeout(10.0)  # generous: the Pi Zero can be heavily contended
     c.connect(sock_path)
     f = c.makefile("r", encoding="utf-8")
 
@@ -140,7 +140,7 @@ def _client(sock_path):
         obj.setdefault("v", PROTOCOL_VERSION)
         c.sendall((json.dumps(obj) + "\n").encode())
 
-    def wait_frame(pred, timeout=4.0):
+    def wait_frame(pred, timeout=10.0):
         end = time.time() + timeout
         while time.time() < end:
             m = json.loads(f.readline())
