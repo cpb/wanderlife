@@ -3,6 +3,8 @@
 Conway's Game of Life playground for a PS3 controller, built with pygame
 (controller input) + curses (terminal rendering). Runs on a Raspberry Pi.
 
+![Wanderlife demo](demo.gif)
+
 ## Pieces
 
 | File | Role |
