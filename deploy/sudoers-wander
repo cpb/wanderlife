@@ -1,4 +1,0 @@
-# Allow user cpb to restart (and only restart) the wander game service
-# without a password, so the git post-receive deploy hook can bounce it.
-# Install to /etc/sudoers.d/wander with mode 0440 (validate: visudo -cf).
-cpb ALL=(root) NOPASSWD: /usr/bin/systemctl restart wander

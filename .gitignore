@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .DS_Store
 wander_save.json
+wander_worlds/
+*.sock
+wander-server.log

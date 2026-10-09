@@ -1,4 +1,4 @@
-# wander
+# wanderlife
 
 Conway's Game of Life playground for a PS3 controller, built with pygame
 (controller input) + curses (terminal rendering). Runs on a Raspberry Pi.
@@ -8,12 +8,38 @@ Conway's Game of Life playground for a PS3 controller, built with pygame
 | File | Role |
 |------|------|
 | `wander_game.py` | shared game logic + `World` (pure python: no pygame, no curses) |
-| `wander_server.py` | headless game server: hosts persistent worlds over a UNIX socket, systemd-managed |
-| `wander_client.py` | PS3+curses client: opens at a world menu, plays attached worlds |
-| `wander.py` | standalone single-player build (no server needed) |
-| `wander.service` | systemd unit for the server |
+| `wander_server.py` | headless game server: hosts persistent worlds over a UNIX socket |
+| `wander_client.py` | curses client: PS3 controller, keyboard and touchpad/mouse all work; opens at a world menu, plays attached worlds |
+| `wander.py` | standalone single-player build (no server needed; requires pygame) |
+| `wanderctl` | dev-machine launcher: start the server if needed and play, stop, optional launchd autostart |
+| `deploy/` | push-deploy provisioning: `setup-host.sh`, systemd/sudoers/launchd templates, `post-receive` hook |
 
-## Run (server mode)
+## Install & run (macOS / Linux)
+
+Requires Python 3 -- no dependencies beyond the standard library
+(pygame is optional; you only need it for a PS3 controller).
+
+```sh
+git clone https://github.com/cpb/wanderlife.git
+cd wanderlife
+./wanderctl play
+```
+
+`wanderctl play` starts the server in the background if it isn't running,
+then launches the client (just the client if the server is already up):
+
+No pygame needed here -- the client plays with keyboard + touchpad:
+**left-click a cell to walk there, right-click to kill (SQUARE),
+double-click to erase (X)**, and click menu rows to select/choose.
+
+```sh
+./wanderctl stop               # shut the server down (worlds are saved)
+./wanderctl status             # what's running?
+./wanderctl install-service    # optional: launchd, server starts at login
+./wanderctl uninstall-service  # remove that again
+```
+
+## Run (server mode, on the Pi)
 
 The server runs in the background via systemd:
 
@@ -44,7 +70,17 @@ full speed while anyone is playing.
 
 Keyboard controls (when no controller is present): arrows/hjkl/wasd move,
 `SPACE`=SQUARE, `x`=X, `o`=CIRCLE, `t`=TRIANGLE, `[`/`]`=L1/R1,
-`-`/`=`=L2/R2, `b`=R3, `ESC`/`m`=menu, `ENTER`=confirm.
+`-`/`=`=L2/R2, `b`=R3, `ESC`/`m`=menu, `ENTER`=confirm, `?`=controls guide. `TAB`/
+`shift-TAB` cycles the placeable patterns (all nine gallery forms; like
+picking from the gallery, this switches to setup/paint mode).
+
+Mouse/touchpad controls (any terminal with mouse reporting, e.g. macOS
+Terminal.app or iTerm2): **left-click a cell** = walk toward it,
+**right-click** = SQUARE (kill / spawn baddie), **double-click** = X
+(erase / reclaim), **click the `[ SETUP ]`/`[ RUN ]` badge** in the top
+border = toggle paint ↔ run mode, **click a menu row** = select,
+**click it again** = choose. Keyboard, controller and mouse can all be
+used at the same time.
 
 ## Run (standalone)
 
@@ -102,6 +138,9 @@ Tuning knobs live at the top of `wander.py`: `KILL_RADIUS`, `MAX_KILL_RADIUS`,
 | L2 / R2           | Setup: cycle static patterns · **Run: shrink / grow @'s area of effect** |
 | R3 (right stick)  | Stop / unleash the baddies |
 | SELECT or START   | Open the **menu**: Resume · Gallery · Save game · Load game · Stop/Resume baddies · Seed new life · Clear board · Quit |
+| TAB / shift-TAB   | Cycle the nine placeable patterns forward / backward (switches to setup/paint mode, like the gallery) |
+| Mouse / touchpad  | Left-click a cell: walk there · right-click: kill / spawn baddie · double-click: erase · **click the mode badge: paint ↔ run** · menus: click to select, click again to choose |
+| ?                 | Pop the in-client controls guide (keyboard + mouse) — works in-game and in every menu |
 
 In run mode the Game of Life ticks and `@` participates as a living cell.
 
@@ -122,34 +161,58 @@ rejected. Client: `list` / `create` / `delete` / `attach` (with
 `role: play|watch`; play clients get a `pid` and a spawned avatar) /
 `detach` / `input` (move + button actions, applied to the caller's own
 avatar) / `command` (save, clear, seed, stop_baddies, set_pattern).
-Server replies `{"ok": ...}` and streams frames at 10 Hz: the attach
+Server replies `{"ok": ...}` to the five rpc-style commands
+(`input`/`command` are fire-and-forget and get no reply, so a stale `ok`
+is never mistaken for a later one) and streams frames at 10 Hz: the attach
 response is the client's full snapshot, later frames are **deltas**
 containing only changed fields (nothing is sent while the world is
 unchanged; a 5 s heartbeat proves liveness).
 
 ## Deployment
 
-The deploy target is the Pi at `192.168.8.195`; the game lives in the home
-directory there. Deployment is a plain git push:
+The deploy target is the Pi at `pi.local` (a `/etc/hosts` entry maps the
+name to its LAN address: `192.168.8.195 pi.local`); the game lives in the
+home directory there. Deployment is a plain git push:
 
 ```sh
 git push deploy main
 ```
 
-How it works:
+### Provisioning a fresh host
+
+One command, run from the workstation (it renders the systemd unit and
+sudoers rule for the user you log in as, installs the bare repo and the
+post-receive hook, enables and starts the service):
+
+```sh
+ssh pi.local 'sh -s' < deploy/setup-host.sh
+git remote add deploy pi.local:wander.git   # or: git remote set-url deploy ...
+```
+
+The pieces it installs are versioned here as templates:
+`deploy/wander.service.template` and `deploy/sudoers-wander.template`
+(placeholders `__WANDER_USER__` / `__WANDER_HOME__`), plus the ready-made
+`deploy/post-receive` hook.
+
+### How it works
 
 - The Pi has **no system git** (and originally no passwordless sudo), so a
   rootless git is unpacked from the Raspbian `.deb` into `~/opt/git`
   (`apt-get download git` + `dpkg -x`).
   `~/opt/git/receive-pack-wrapper.sh` sets `PATH`/`GIT_EXEC_PATH` and is
   what the local repo invokes over SSH
-  (`git config remote.deploy.receivepack /home/cpb/opt/git/receive-pack-wrapper.sh`).
+  (`git config remote.deploy.receivepack ~/opt/git/receive-pack-wrapper.sh`,
+  expanded on the Pi).
 - `~/wander.git` is a bare repo; its `hooks/post-receive` (versioned in
   this repo as `deploy/post-receive`) checks out `main` into `$HOME` on
   every push and **restarts the wander service automatically when game
   code changed**, via `sudo -n systemctl restart wander`.
-- `/etc/sudoers.d/wander` (versioned as `deploy/sudoers-wander`) grants
-  `cpb` NOPASSWD rights to *exactly* `systemctl restart wander` — nothing
-  else, and the password is not stored anywhere.
+- `/etc/sudoers.d/wander` (rendered from `deploy/sudoers-wander.template`)
+  grants the deploy user NOPASSWD rights to *exactly* `systemctl restart
+  wander` — nothing else, and the password is not stored anywhere.
 - The pre-git `wander.py` was backed up to `~/wander.py.bak.*` before the
   first deploy.
+
+## License
+
+[MIT](LICENSE).

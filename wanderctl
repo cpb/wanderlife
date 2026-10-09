@@ -1,0 +1,139 @@
+#!/bin/sh
+# wanderctl -- launch + manage the wander server on a dev machine (macOS
+# and Linux). On the Pi the server is systemd-managed instead (see the
+# README "Deployment" section).
+#
+#   wanderctl play      start the server if needed, then launch the client;
+#                       if the server is already up, just launch the client
+#                       (this is the default with no arguments)
+#   wanderctl start     start the background server only
+#   wanderctl stop      shut the server down (saves all worlds)
+#   wanderctl status    show server / launchd state
+#   wanderctl install-service     macOS: start the server at login (launchd)
+#   wanderctl uninstall-service   remove the launchd service
+#
+# Paths: socket ~/wander_server.sock, worlds ~/wander_worlds/
+# (override with WANDER_SOCKET_PATH / WANDER_WORLDS_DIR).
+set -eu
+
+LABEL=com.wander.server
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SOCKET=${WANDER_SOCKET_PATH:-"$HOME/wander_server.sock"}
+LOGDIR="$HOME/Library/Logs"
+[ -d "$LOGDIR" ] || LOGDIR=$HOME   # Linux fallback
+LOG="$LOGDIR/wander-server.log"
+PY=$(command -v python3)
+
+server_alive() {
+    [ -S "$SOCKET" ] || return 1
+    PYTHONPATH="$DIR" "$PY" - "$SOCKET" <<'EOF' >/dev/null 2>&1
+import json, socket, sys
+from wander_game import PROTOCOL_VERSION
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(1.0)
+s.connect(sys.argv[1])
+s.sendall((json.dumps({"v": PROTOCOL_VERSION, "cmd": "list"}) + "\n").encode())
+sys.exit(0 if b'"ok": true' in s.recv(65536) else 1)
+EOF
+}
+
+launchd_loaded() {
+    command -v launchctl >/dev/null 2>&1 \
+        && launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1
+}
+
+start_server() {
+    if server_alive; then
+        echo "wander server already running (socket $SOCKET)"
+        return 0
+    fi
+    if launchd_loaded; then
+        echo "starting via launchd ($LABEL) ..."
+        launchctl kickstart "gui/$(id -u)/$LABEL"
+    else
+        echo "starting wander_server.py in the background (log: $LOG) ..."
+        nohup "$PY" "$DIR/wander_server.py" >>"$LOG" 2>&1 &
+    fi
+    i=0
+    while [ $i -lt 50 ]; do
+        if server_alive; then
+            echo "server is up"
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 0.1
+    done
+    echo "server did not come up -- check $LOG" >&2
+    return 1
+}
+
+stop_server() {
+    stopped=0
+    if launchd_loaded; then
+        launchctl bootout "gui/$(id -u)/$LABEL" && stopped=1
+        echo "stopped (launchd service booted out; it returns at next login"
+        echo "unless you run: wanderctl uninstall-service)"
+    fi
+    pids=$(pgrep -f "$DIR/wander_server.py" || true)
+    if [ -n "$pids" ]; then
+        # SIGTERM -> the server saves all worlds before exiting
+        kill -TERM $pids && stopped=1
+        echo "sent SIGTERM to wander server (pid $pids); worlds saved"
+    fi
+    [ $stopped -eq 1 ] || echo "no wander server running"
+}
+
+cmd=${1:-play}
+case "$cmd" in
+    play)
+        start_server
+        exec "$PY" "$DIR/wander_client.py"
+        ;;
+    start)
+        start_server
+        ;;
+    stop)
+        stop_server
+        ;;
+    status)
+        if server_alive; then
+            echo "server: up (socket $SOCKET)"
+        else
+            echo "server: down"
+        fi
+        pgrep -fl "wander_server.py" || true
+        if launchd_loaded; then
+            echo "launchd: $LABEL loaded (starts at login)"
+        else
+            echo "launchd: not installed"
+        fi
+        ;;
+    install-service)
+        src="$DIR/deploy/$LABEL.plist.template"
+        dst_dir="$HOME/Library/LaunchAgents"
+        dst="$dst_dir/$LABEL.plist"
+        mkdir -p "$dst_dir"
+        sed -e "s|__PYTHON3__|$PY|g" \
+            -e "s|__REPO_DIR__|$DIR|g" \
+            -e "s|__HOME__|$HOME|g" "$src" > "$dst"
+        launchctl unload "$dst" 2>/dev/null || true
+        launchctl load -w "$dst"
+        echo "installed $LABEL -> $dst"
+        echo "the server now starts at login and restarts on crash"
+        echo "(undo with: wanderctl uninstall-service)"
+        ;;
+    uninstall-service)
+        dst="$HOME/Library/LaunchAgents/$LABEL.plist"
+        if [ -f "$dst" ]; then
+            launchctl unload "$dst" 2>/dev/null || true
+            rm -f "$dst"
+            echo "removed $LABEL"
+        else
+            echo "$LABEL is not installed"
+        fi
+        ;;
+    *)
+        sed -n '2,17p' "$0"
+        exit 1
+        ;;
+esac

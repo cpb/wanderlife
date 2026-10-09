@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""wander_server.py -- headless wander game server (protocol v2).
+"""wander_server.py -- headless wander game server (protocol v3).
 
 Hosts persistent Game-of-Life worlds over a UNIX socket. A world ticks at
 full speed while at least one client is attached and BACKGROUND_SLOWDOWN
@@ -20,20 +20,22 @@ protocol version as "v". Clients should send "v" too; mismatches are
 rejected.
 
   client -> server
-    {"v": 2, "cmd": "list"}
-    {"v": 2, "cmd": "create", "name": "foo", "max_x": 78, "max_y": 22}
-    {"v": 2, "cmd": "delete", "name": "foo"}
-    {"v": 2, "cmd": "attach", "name": "foo", "role": "play"|"watch"}
-    {"v": 2, "cmd": "detach"}
-    {"v": 2, "cmd": "input", "action": "move", "dx": 1, "dy": 0}
-    {"v": 2, "cmd": "input", "action": "square"}  x/circle/triangle/l1/r1/l2/r2
-    {"v": 2, "cmd": "command", "do": "save"|"clear"|"seed"|"stop_baddies"}
-    {"v": 2, "cmd": "command", "do": "set_pattern", "idx": 3}
+    {"v": 3, "cmd": "list"}
+    {"v": 3, "cmd": "create", "name": "foo", "max_x": 78, "max_y": 22}
+    {"v": 3, "cmd": "delete", "name": "foo"}
+    {"v": 3, "cmd": "attach", "name": "foo", "role": "play"|"watch"}
+    {"v": 3, "cmd": "detach"}
+    {"v": 3, "cmd": "input", "action": "move", "dx": 1, "dy": 0}
+    {"v": 3, "cmd": "input", "action": "square"}  x/circle/triangle/l1/r1/l2/r2
+    {"v": 3, "cmd": "command", "do": "save"|"clear"|"seed"|"stop_baddies"}
+    {"v": 3, "cmd": "command", "do": "set_pattern", "idx": 3}
 
   server -> client
-    {"v": 2, "ok": true, ...} / {"v": 2, "ok": false, "error": "..."}
-    {"v": 2, "type": "state", "rev": n, "full": true,  "state": {...}}
-    {"v": 2, "type": "state", "rev": n, "full": false, "delta": {...}}
+    {"v": 3, "ok": true, ...} / {"v": 3, "ok": false, "error": "..."}
+    (only list/create/delete/attach/detach get replies; input and command
+    are fire-and-forget so a stale ok is never mistaken for a later reply)
+    {"v": 3, "type": "state", "rev": n, "full": true,  "state": {...}}
+    {"v": 3, "type": "state", "rev": n, "full": false, "delta": {...}}
 
 Paths default to the home directory and can be overridden with
 WANDER_SOCKET_PATH / WANDER_WORLDS_DIR (used by the test suite).

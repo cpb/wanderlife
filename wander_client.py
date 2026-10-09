@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""wander_client.py -- client for the wander game server (protocol v2).
+"""wander_client.py -- client for the wander game server (protocol v3).
 
 Opens at a world menu: play an existing world, create a new one, watch a
-world, or delete one. Multiple clients can attach to the same world --
-several players share the one '@' (chaos is a feature), or attach with
-the watch role to just observe.
+world, or delete one. Multiple clients can attach to the same world and
+every play client spawns its own '@' (yours is cyan, everyone else's is
+green); attach with the watch role to just observe.
 
-Input: a paired PS3 controller and the keyboard both work at the same
-time (if no controller is detected the client is keyboard-only).
+Input: a paired PS3 controller, the keyboard and the mouse/touchpad all
+work at the same time. The controller needs pygame; without pygame the
+client is keyboard + touchpad -- which is how it runs on macOS.
 
-  move            arrows / hjkl / wasd
-  SQUARE kill     SPACE          X erase       x
-  CIRCLE stamp    o              TRIANGLE run  t
-  L1 / R1         [ / ]          L2 / R2       - / =
-  R3 (baddies)    b              menu          ESC or m
-  confirm         ENTER          (menus)       arrows + ENTER
+  move            arrows / hjkl / wasd / left-click a cell
+  SQUARE kill     SPACE / right-click
+  X erase         x / double-click      X X clear   double-tap x
+  CIRCLE stamp    o                     TRIANGLE run  t
+  paint/run mode  click the [ SETUP ]/[ RUN ] badge in the top border (or t)
+  placeables      TAB / shift-TAB cycle all nine (also [ ] and - =)
+  R3 (baddies)    b                     menu          ESC or m
+  confirm         ENTER / click         (menus)       arrows + ENTER / click
+  help            ?  (controls guide; works in-game and in every menu)
 
   python3 wander_client.py
 """
@@ -28,9 +32,13 @@ import json
 import socket
 import time
 
-import pygame
+try:
+    import pygame
+except ImportError:
+    pygame = None  # no controller support; keyboard + touchpad still work
 
-from wander_game import (ALL_PATTERNS, PATTERNS_OSCILLATORS, PROTOCOL_VERSION)
+from wander_game import (ALL_PATTERNS, PATTERNS_OSCILLATORS,
+                         PATTERNS_STATIC, PROTOCOL_VERSION)
 
 BASE = os.path.expanduser("~")
 SOCKET_PATH = os.environ.get("WANDER_SOCKET_PATH",
@@ -61,6 +69,9 @@ KEYMAP = {
     "start": {27},
     "confirm": {curses.KEY_ENTER, 10, 13},
     "watch": {ord("v")},
+    "help": {ord("?")},              # ?: controls guide overlay
+    "tab": {9},                      # TAB: next placeable
+    "shift_tab": {curses.KEY_BTAB},  # shift-TAB: previous placeable
 }
 
 # Logical buttons forwarded to the world as game actions
@@ -71,6 +82,7 @@ ACTION_BUTTONS = ("square", "x", "circle", "triangle", "l1", "r1", "l2", "r2")
 
 class PadInput:
     kind = "pad"
+    clicks = []  # mouse events are collected by KeyInput
 
     def __init__(self):
         pygame.init()
@@ -128,6 +140,10 @@ class CombinedInput:
         self.pad = PadInput()
         self.keys = KeyInput(stdscr)
 
+    @property
+    def clicks(self):
+        return self.keys.clicks
+
     def pump(self):
         self.pad.pump()
         self.keys.pump()
@@ -146,19 +162,31 @@ class CombinedInput:
 
 
 class KeyInput:
+    """Keyboard plus terminal mouse (touchpad taps arrive as mouse clicks)."""
     kind = "keys"
 
     def __init__(self, stdscr):
         stdscr.keypad(True)
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        curses.mouseinterval(0)  # report clicks immediately, no ESC delay
         self.stdscr = stdscr
         self.keys = []
+        self.clicks = []  # (x, y, bstate) collected since the last pump
 
     def pump(self):
         self.keys = []
+        self.clicks = []
         while True:
             k = self.stdscr.getch()
             if k == -1:
                 break
+            if k == curses.KEY_MOUSE:
+                try:
+                    _, mx, my, _, bstate = curses.getmouse()
+                    self.clicks.append((mx, my, bstate))
+                except curses.error:
+                    pass
+                continue
             self.keys.append(k)
 
     def nav(self):
@@ -254,20 +282,42 @@ def safe_addstr(win, y, x, s, attr=0):
 
 # --------------------------------------------------------------------- Menus
 
+def clicked(bstate, button=1):
+    """True if a curses mouse bstate is any press/click of `button`."""
+    names = {1: ("BUTTON1_PRESSED", "BUTTON1_CLICKED", "BUTTON1_DOUBLE_CLICKED"),
+             3: ("BUTTON3_PRESSED", "BUTTON3_CLICKED", "BUTTON3_DOUBLE_CLICKED")}
+    return any(bstate & getattr(curses, n, 0) for n in names[button])
+
+
 def run_menu(stdscr, inp, sw, sh, title, items,
-             hint="move: D-Pad/keys   choose: X/ENTER   back: SELECT/ESC"):
+             hint="move: D-Pad/keys   choose: X/ENTER/click   back: SELECT/ESC   ?: help"):
     inp.release_sync()
     sel = 0
     move_cd = time.time()
+    y0 = max(2, sh // 2 - len(items))
+    x0 = max(4, sw // 2 - 20)
 
     while True:
         inp.pump()
         now = time.time()
 
+        if inp.edge("help"):
+            show_help(stdscr, inp, sw, sh)
+            continue
+
         _, dy = inp.nav()
         if dy and now - move_cd > 0.18:
             move_cd = now
             sel = (sel + (1 if dy > 0 else -1)) % len(items)
+
+        # Mouse: click a row to select it; click the selected row to choose.
+        for cx, cy, bstate in inp.clicks:
+            if clicked(bstate) and y0 <= cy < y0 + len(items) and cx >= x0:
+                idx = cy - y0
+                if idx == sel:
+                    inp.release_sync()
+                    return items[sel][0]
+                sel = idx
 
         if inp.edge("x") or inp.edge("circle") or inp.edge("confirm"):
             inp.release_sync()
@@ -283,8 +333,6 @@ def run_menu(stdscr, inp, sw, sh, title, items,
         stdscr.attroff(attr)
         safe_addstr(stdscr, 0, max(2, (sw - len(title) - 2) // 2), f" {title} ", attr)
 
-        y0 = max(2, sh // 2 - len(items))
-        x0 = max(4, sw // 2 - 20)
         for i, (_, label) in enumerate(items):
             line_attr = (curses.color_pair(1) | curses.A_BOLD) if i == sel else curses.color_pair(3)
             safe_addstr(stdscr, y0 + i, x0, ("-> " if i == sel else "   ") + label, line_attr)
@@ -299,17 +347,30 @@ def run_gallery_menu(stdscr, inp, sw, sh):
     inp.release_sync()
     sel = 0
     move_cd = time.time()
-    hint = "browse: D-Pad/keys   choose: X/ENTER   back: SELECT/ESC"
+    hint = "browse: D-Pad/keys   choose: X/ENTER   back: SELECT/ESC   ?: help"
 
     while True:
         inp.pump()
         now = time.time()
+
+        if inp.edge("help"):
+            show_help(stdscr, inp, sw, sh)
+            continue
 
         dx, dy = inp.nav()
         nav = dy or dx
         if nav and now - move_cd > 0.16:
             move_cd = now
             sel = (sel + (1 if nav > 0 else -1)) % len(ALL_PATTERNS)
+
+        # Mouse: click a pattern row to select it; click again to choose.
+        for cx, cy, bstate in inp.clicks:
+            if clicked(bstate) and 3 <= cy < 3 + len(ALL_PATTERNS):
+                idx = cy - 3
+                if idx == sel:
+                    inp.release_sync()
+                    return sel
+                sel = idx
 
         if inp.edge("x") or inp.edge("circle") or inp.edge("confirm"):
             inp.release_sync()
@@ -357,6 +418,65 @@ def run_gallery_menu(stdscr, inp, sw, sh):
         time.sleep(0.02)
 
 
+# -------------------------------------------------------------- Help screen
+
+HELP_LINES = [
+    ("head", "Setup (paint) mode -- draw with the keyboard:"),
+    ("item", "t                toggle paint <-> run (TRIANGLE)"),
+    ("item", "TAB / shift-TAB  cycle the nine placeables (drops into paint mode)"),
+    ("item", "[ / ]            cycle oscillators (L1/R1)"),
+    ("item", "- / =            cycle static patterns (L2/R2)"),
+    ("item", "o                stamp the active pattern at @ (CIRCLE)"),
+    ("item", "x                erase * / reclaim X / neutralize baddie"),
+    ("item", "x x              clear the board (double-tap)"),
+    ("item", "SPACE            kill patch around @ / spawn baddie beside X (SQUARE)"),
+    ("gap", ""),
+    ("head", "Mouse / touchpad (either mode):"),
+    ("item", "left-click a cell     walk there"),
+    ("item", "right-click           kill / spawn baddie (SQUARE)"),
+    ("item", "double-click          erase / reclaim (X)"),
+    ("item", "click [SETUP]/[RUN]   toggle paint <-> run (badge, top border)"),
+    ("item", "menus: click a row to select, click it again to choose"),
+    ("gap", ""),
+    ("head", "Any time:"),
+    ("item", "arrows / hjkl / wasd  move @, navigate menus"),
+    ("item", "ENTER  confirm        b  stop/unleash baddies (R3)"),
+    ("item", "ESC/m  menu           ?  this help"),
+]
+
+
+def show_help(stdscr, inp, sw, sh):
+    """'?' overlay: the keyboard + mouse guide. Closes on ?/ESC/ENTER/X/click."""
+    inp.release_sync()
+    x0 = max(2, sw // 2 - 39)
+    hint = "close: ? / ESC / ENTER / X / click"
+    while True:
+        inp.pump()
+        if (inp.edge("help") or inp.edge("select") or inp.edge("start")
+                or inp.edge("confirm") or inp.edge("x") or inp.clicks):
+            inp.release_sync()
+            return
+        stdscr.erase()
+        attr = curses.color_pair(4) | curses.A_BOLD
+        stdscr.attron(attr)
+        stdscr.border(0, 0, 0, 0, 0, 0, 0, 0)
+        stdscr.attroff(attr)
+        safe_addstr(stdscr, 0, 4, " HELP -- keys & mouse ", attr)
+        y = 2
+        for kind, text in HELP_LINES:
+            if y >= sh - 2:
+                break
+            if kind == "head":
+                safe_addstr(stdscr, y, x0, text, curses.color_pair(2) | curses.A_BOLD)
+            elif text:
+                safe_addstr(stdscr, y, x0, text, curses.color_pair(3))
+            y += 1
+        safe_addstr(stdscr, sh - 2, max(2, (sw - len(hint)) // 2), hint,
+                    curses.color_pair(2))
+        stdscr.refresh()
+        time.sleep(0.02)
+
+
 # --------------------------------------------------------------- World menu
 
 def next_world_name(worlds):
@@ -394,10 +514,23 @@ def pick_world(stdscr, inp, conn, sw, sh):
         sel = min(sel, len(items) - 1)
 
         inp.pump()
+        if inp.edge("help"):
+            show_help(stdscr, inp, sw, sh)
+            continue
+
         _, dy = inp.nav()
         if dy and now - move_cd > 0.18:
             move_cd = now
             sel = (sel + (1 if dy > 0 else -1)) % len(items)
+
+        # Mouse: click a row to select it; click the selected row to play.
+        clicked_sel = False
+        for cx, cy, bstate in inp.clicks:
+            if clicked(bstate) and 4 <= cy < 4 + len(items) and cx >= 6:
+                idx = cy - 4
+                if idx == sel:
+                    clicked_sel = True
+                sel = idx
 
         choice = items[sel]
 
@@ -407,7 +540,8 @@ def pick_world(stdscr, inp, conn, sw, sh):
                 return ("play", r["state"], r.get("role", role), r.get("pid"))
             raise ConnectionError(r.get("error", "attach failed"))
 
-        if inp.edge("x") or inp.edge("circle") or inp.edge("confirm"):
+        if (inp.edge("x") or inp.edge("circle") or inp.edge("confirm")
+                or clicked_sel):
             inp.release_sync()
             dirty = True
             if choice == "Quit":
@@ -455,9 +589,10 @@ def pick_world(stdscr, inp, conn, sw, sh):
         stdscr.attron(attr)
         stdscr.border(0, 0, 0, 0, 0, 0, 0, 0)
         stdscr.attroff(attr)
-        safe_addstr(stdscr, 0, 4, " WANDER WORLDS ", attr)
-        mode = {"pad": "PS3 controller", "keys": "keyboard",
-                "combined": "PS3 controller + keyboard"}[inp.kind]
+        safe_addstr(stdscr, 0, 4, " WANDERLIFE ", attr)
+        mode = {"pad": "PS3 controller",
+                "keys": "keyboard + touchpad",
+                "combined": "PS3 controller + keyboard + touchpad"}[inp.kind]
         safe_addstr(stdscr, 1, 4, f"server: {SOCKET_PATH}   input: {mode}",
                     curses.color_pair(3))
 
@@ -478,7 +613,7 @@ def pick_world(stdscr, inp, conn, sw, sh):
             line_attr = (curses.color_pair(1) | curses.A_BOLD) if i == sel else curses.color_pair(3)
             safe_addstr(stdscr, y0 + i, 6, ("-> " if i == sel else "   ") + items[i], line_attr)
 
-        hint = "X/ENTER: play   TRIANGLE/v: watch   SQUARE x2: delete"
+        hint = "X/ENTER/click: play   TRIANGLE/v: watch   SQUARE x2: delete   ?: help"
         safe_addstr(stdscr, sh - 2, max(2, (sw - len(hint)) // 2), hint, curses.color_pair(2))
         if now < flash_until:
             safe_addstr(stdscr, sh - 1, max(1, sw - len(flash) - 3), flash,
@@ -504,6 +639,19 @@ def find_player(state, pid):
     return None
 
 
+def placeable_index(player):
+    """Global ALL_PATTERNS index of a player's active placeable, or None."""
+    if not player:
+        return None
+    dynamic = player["category"] == "dynamic"
+    names = PATTERNS_OSCILLATORS if dynamic else PATTERNS_STATIC
+    base = 0 if dynamic else len(PATTERNS_OSCILLATORS)
+    try:
+        return base + [n for n, _ in names].index(player["pattern_name"])
+    except ValueError:
+        return None
+
+
 def render_state(stdscr, state, ast_set, dead_set, my, pred_pos, sw, sh, role):
     max_x, max_y = state["max_x"], state["max_y"]
     is_running = state["is_running"]
@@ -520,11 +668,20 @@ def render_state(stdscr, state, ast_set, dead_set, my, pred_pos, sw, sh, role):
 
     if role == "watch":
         head = f"[ WATCHING: {state['name']} ]  SEL/ESC: menu"
-    elif is_running:
-        head = "[ RUN ] □:kill ✕:erase(✕✕:clear) L2/R2:area R3:stop △:setup SEL:menu"
+        safe_addstr(stdscr, 0, 4, f" {head} ", border_attr | curses.A_BOLD)
     else:
-        head = "[ SETUP ] □:kill/spawn ○:stamp ✕:erase(✕✕:clear) △:run SEL:menu"
-    safe_addstr(stdscr, 0, 4, f" {head} ", border_attr | curses.A_BOLD)
+        # The mode badge is a button: click it to toggle paint <-> run.
+        badge = "[ RUN ]" if is_running else "[ SETUP ]"
+        if is_running:
+            hints = ("click:go r-click:kill dbl-click:erase "
+                     "L2/R2:area R3:stop △:setup SEL:menu ?:help")
+        else:
+            hints = ("click:go r-click:kill/spawn ○:stamp ✕:erase(✕✕:clear) "
+                     "△:run SEL:menu ?:help")
+        safe_addstr(stdscr, 0, 4, f" {badge} ",
+                    border_attr | curses.A_BOLD | curses.A_REVERSE)
+        safe_addstr(stdscr, 0, 4 + len(badge) + 2, f" {hints} ",
+                    border_attr | curses.A_BOLD)
     bmark = "s" if state["baddies_stopped"] else ""
     rtxt = f"R{my_radius}" if my else ""
     stats = (f" *{len(ast_set)} X{len(dead_set)} B{len(state['baddies'])}{bmark}"
@@ -586,6 +743,7 @@ def play_world(stdscr, inp, conn, state, sw, sh, role, my_pid):
     """Attached gameplay: inputs -> server, server delta frames -> render."""
     inp.release_sync()
     move_cd = 0.0
+    click_target = None  # board cell the avatar is walking toward
     my = find_player(state, my_pid)
     if my:
         pred_x, pred_y = my["pos"]          # optimistic own-@ position
@@ -638,12 +796,15 @@ def play_world(stdscr, inp, conn, state, sw, sh, role, my_pid):
                          ("leave", "Leave world"),
                          ("quit", "Quit client")]
             action = run_menu(stdscr, inp, sw, sh, f"WORLD: {state['name']}", items)
-            if action == "leave":
-                conn.send({"cmd": "detach"})
-                return "menu"
-            if action == "quit":
-                conn.send({"cmd": "detach"})
-                return "quit"
+            if action in ("leave", "quit"):
+                # Await the detach reply: otherwise its stale "ok" is
+                # consumed by the next rpc (the world-menu refresh reads
+                # it as its own reply and shows an empty world list).
+                try:
+                    conn.rpc({"cmd": "detach"})
+                except (ConnectionError, OSError):
+                    pass
+                return "menu" if action == "leave" else "quit"
             if action == "gallery":
                 chosen = run_gallery_menu(stdscr, inp, sw, sh)
                 if chosen is not None:
@@ -654,8 +815,39 @@ def play_world(stdscr, inp, conn, state, sw, sh, role, my_pid):
                 conn.send({"cmd": "command", "do": "stop_baddies"})
             continue
 
+        if inp.edge("help"):
+            show_help(stdscr, inp, sw, sh)
+            continue
+
         if role == "play":
-            # Movement: forward + optimistic local prediction
+            # Mouse/touchpad: left-click a cell to walk toward it,
+            # right-click kills (SQUARE), double-click erases (X).
+            for cx, cy, bstate in inp.clicks:
+                # The [ SETUP ]/[ RUN ] badge in the top border is a
+                # button: click it to toggle paint <-> run mode.
+                if cy == 0 and 4 <= cx < 4 + 11 and clicked(bstate, 1):
+                    conn.send({"cmd": "input", "action": "triangle"})
+                    continue
+                if not (1 <= cx <= state["max_x"]
+                        and 1 <= cy <= state["max_y"]):
+                    continue  # ignore clicks on the border/header/footer
+                if bstate & getattr(curses, "BUTTON1_DOUBLE_CLICKED", 0):
+                    conn.send({"cmd": "input", "action": "x"})
+                elif clicked(bstate, 3):
+                    conn.send({"cmd": "input", "action": "square"})
+                elif clicked(bstate, 1):
+                    click_target = (cx, cy)
+
+            # Movement: forward + optimistic local prediction. Keys step
+            # directly (and cancel any walk); a click walks toward a target.
+            if dx or dy:
+                click_target = None
+            elif click_target and now - move_cd > 0.08:
+                tx, ty = click_target
+                dx = (tx > pred_x) - (tx < pred_x)
+                dy = (ty > pred_y) - (ty < pred_y)
+                if not (dx or dy):
+                    click_target = None
             if (dx or dy) and now - move_cd > 0.08:
                 move_cd = now
                 pred_x = max(1, min(state["max_x"], pred_x + dx))
@@ -669,6 +861,15 @@ def play_world(stdscr, inp, conn, state, sw, sh, role, my_pid):
             if inp.edge("r3"):
                 conn.send({"cmd": "command", "do": "stop_baddies"})
 
+            # TAB / shift-TAB cycles the placeable (drops to paint mode,
+            # same as picking a form from the gallery).
+            if inp.edge("tab") or inp.edge("shift_tab"):
+                idx = placeable_index(my)
+                if idx is not None:
+                    step = 1 if inp.edge("tab") else -1
+                    conn.send({"cmd": "command", "do": "set_pattern",
+                               "idx": (idx + step) % len(ALL_PATTERNS)})
+
         render_state(stdscr, state, ast_set, dead_set, my,
                      (pred_x, pred_y), sw, sh, role)
         time.sleep(0.02)
@@ -677,12 +878,15 @@ def play_world(stdscr, inp, conn, state, sw, sh, role, my_pid):
 # -------------------------------------------------------------------- Main
 
 def main(stdscr):
-    # Input: PS3 controller and keyboard together; keyboard-only if no pad
-    pygame.init()
-    pygame.joystick.init()
-    have_pad = pygame.joystick.get_count() > 0
-    if not have_pad:
-        pygame.quit()
+    # Input: PS3 controller (needs pygame) + keyboard + touchpad together;
+    # keyboard/touchpad only when no pad is detected or pygame is missing.
+    have_pad = False
+    if pygame is not None:
+        pygame.init()
+        pygame.joystick.init()
+        have_pad = pygame.joystick.get_count() > 0
+        if not have_pad:
+            pygame.quit()
 
     curses.curs_set(0)
     curses.start_color()

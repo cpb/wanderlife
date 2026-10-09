@@ -1,0 +1,22 @@
+# systemd unit for the wander game server.
+# Rendered and installed by deploy/setup-host.sh (which substitutes
+# __WANDER_USER__ and __WANDER_HOME__); to install by hand:
+#   sed -e "s|__WANDER_USER__|$USER|g" -e "s|__WANDER_HOME__|$HOME|g" \
+#       deploy/wander.service.template | sudo tee /etc/systemd/system/wander.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now wander
+[Unit]
+Description=Wander Game of Life server
+After=network.target
+
+[Service]
+Type=simple
+User=__WANDER_USER__
+Group=__WANDER_USER__
+WorkingDirectory=__WANDER_HOME__
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 __WANDER_HOME__/wander_server.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

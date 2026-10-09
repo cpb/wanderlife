@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- launchd agent for the wander game server (macOS).
+     Installed by `wanderctl install-service`, which substitutes:
+       __PYTHON3__   absolute path of the python3 to run
+       __REPO_DIR__  directory containing wander_server.py
+       __HOME__      your home directory
+     Runs at login and restarts on crash (KeepAlive). To run truly at
+     boot without a login you'd need a LaunchDaemon instead -- overkill
+     for a game. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.wander.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON3__</string>
+        <string>__REPO_DIR__/wander_server.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/wander-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/wander-server.log</string>
+</dict>
+</plist>

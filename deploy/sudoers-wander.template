@@ -1,0 +1,7 @@
+# Allow user __WANDER_USER__ to restart (and only restart) the wander game
+# service without a password, so the git post-receive deploy hook can
+# bounce it. Rendered and installed by deploy/setup-host.sh; by hand:
+#   sed "s|__WANDER_USER__|$USER|g" deploy/sudoers-wander.template \
+#       | sudo tee /etc/sudoers.d/wander
+#   sudo chmod 0440 /etc/sudoers.d/wander   # validate: sudo visudo -cf /etc/sudoers.d/wander
+__WANDER_USER__ ALL=(root) NOPASSWD: /usr/bin/systemctl restart wander
