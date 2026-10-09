@@ -21,13 +21,16 @@ Config (env):
                       once with the other scheme)
   BOT_TICK            seconds between decisions (default 2.5)
 
-If the LLM call fails or returns garbage the bot takes a random step
-instead, so a flaky endpoint never strands it. Detaches cleanly on
-SIGTERM/SIGINT (its avatar despawns like any client's).
+After a move decision the bot keeps that heading for a few cells, so a
+slow reasoning model still wanders smoothly between decisions. If the LLM
+call fails or returns garbage it falls back to a random walk (with the
+occasional SQUARE), so a flaky endpoint never strands it. Detaches cleanly
+on SIGTERM/SIGINT (its avatar despawns like any client's).
 
 Run:  python3 wander_bot.py
 Pi:   see deploy/wander-bot.service.template
 """
+import collections
 import json
 import os
 import random
@@ -35,11 +38,13 @@ import re
 import signal
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 
-from wander_game import ALL_PATTERNS, PROTOCOL_VERSION
+from wander_game import (ALL_PATTERNS, PATTERNS_OSCILLATORS,
+                         PROTOCOL_VERSION)
 
 SOCK = os.environ.get("WANDER_SOCKET_PATH",
                       os.path.expanduser("~/wander_server.sock"))
@@ -55,25 +60,34 @@ BOT_TICK = float(os.environ.get("BOT_TICK", "2.5"))
 LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "25"))
 VIEW = 6  # observation window radius (13x13)
 
-SYSTEM = """You are playing Wanderlife, a multiplayer Conway's Game of Life
+PATTERN_MENU = ", ".join(
+    f"{i}:{name}({'osc' if i < len(PATTERNS_OSCILLATORS) else 'static'})"
+    for i, (name, _) in enumerate(ALL_PATTERNS))
+
+SYSTEM = f"""You are playing Wanderlife, a multiplayer Conway's Game of Life
 playground, as the avatar @ on a grid. You decide ONE action per turn.
 
 World: '*' living cell, 'X' dead cell (unoccupiable), '>v<^' baddies that
 hunt living cells, '@' you, 'o' other players, '.' empty.
 
 Actions (reply with exactly one JSON object, nothing else):
-  {"action":"move","dx":-1..1,"dy":-1..1}   step one cell
-  {"action":"square"}   kill stars around you; beside an X: raise a baddie
-  {"action":"x"}        erase * / reclaim X / neutralize a baddie under you
-  {"action":"circle"}   stamp your active pattern (setup mode only)
-  {"action":"triangle"} toggle setup <-> run mode
-  {"action":"pattern","idx":0..8}           select the pattern circle stamps
-  {"action":"seed"}     scatter new life    {"action":"wait"}  do nothing
+  {{"action":"move","dx":-1..1,"dy":-1..1}}   step; the bot keeps the heading
+                          for a few cells, so you really travel
+  {{"action":"square"}}   kill stars around you; beside an X: raise a baddie
+  {{"action":"x"}}        erase * / reclaim X / neutralize a baddie under you
+  {{"action":"circle"}}   stamp your active pattern (setup mode only)
+  {{"action":"triangle"}} toggle setup <-> run mode
+  {{"action":"pattern","idx":0..8}}           select what circle stamps
+  {{"action":"seed"}}     scatter new life    {{"action":"wait"}}  do nothing
 Optional "why":"short reason".
 
-Play style: wander with purpose. Stamp oscillators/gliders in setup mode,
-flip to run to watch them live, kill overgrowth with square, keep baddies
-spread out (crowded baddies self-destruct). Don't spam triangle/seed."""
+Stampable patterns (idx): {PATTERN_MENU}
+
+Rhythm: wander until you find open space; in setup mode pick a pattern and
+stamp a small garden (circle a few times); triangle into run mode and let
+it live; square to prune overgrowth; back to setup to plant again. Change
+modes when it makes sense -- don't camp in one mode all game. Use seed
+sparingly, and never stamp onto another player."""
 
 
 # --------------------------------------------------------------- protocol
@@ -155,17 +169,10 @@ def resolve_auth_scheme(base_url):
             or ("Api-Key" if "baseten" in base_url else "Bearer"))
 
 
-def ask_llm(observation, memory):
-    msgs = [{"role": "system", "content": SYSTEM}]
-    for prev in memory[-5:]:
-        msgs.append({"role": "assistant", "content": json.dumps(prev)})
-    msgs.append({"role": "user", "content": observation})
-    payload = json.dumps({"model": LLM_MODEL, "messages": msgs,
-                          "temperature": 0.4, "stream": False}).encode()
-    url = f"{LLM_BASE_URL.rstrip('/')}/chat/completions"
-    # Baseten documents Api-Key but also accepts Bearer (pi's baseten
-    # provider uses Bearer): unless the scheme was pinned explicitly,
-    # retry a 401/403 once with the other scheme.
+def http_json(url, payload=None):
+    """GET/POST with the key; Baseten documents Api-Key but also accepts
+    Bearer (pi's baseten provider uses Bearer): unless the scheme was
+    pinned explicitly, retry a 401/403 once with the other scheme."""
     schemes = [resolve_auth_scheme(LLM_BASE_URL)]
     if not os.environ.get("LLM_AUTH_SCHEME"):
         schemes.append("Bearer" if schemes[0] == "Api-Key" else "Api-Key")
@@ -176,17 +183,97 @@ def ask_llm(observation, memory):
                      "Authorization": f"{scheme} {LLM_API_KEY}"})
         try:
             with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
-                body = json.loads(r.read())
-            return extract_json(body["choices"][0]["message"]["content"] or "")
+                return json.loads(r.read())
         except urllib.error.HTTPError as e:
             if e.code in (401, 403) and i + 1 < len(schemes):
                 continue
             raise
 
 
+def resolve_model():
+    """Map LLM_MODEL to the endpoint's canonical id via /models:
+    exact > case-insensitive > unique suffix (kimi-k3 -> moonshotai/Kimi-K3)."""
+    try:
+        data = http_json(f"{LLM_BASE_URL.rstrip('/')}/models")
+        ids = [m.get("id", "") for m in data.get("data", [])]
+    except Exception as e:
+        print(f"bot: cannot list models ({type(e).__name__}: {e}); "
+              f"using {LLM_MODEL!r} as-is", flush=True)
+        return LLM_MODEL
+    if LLM_MODEL in ids:
+        return LLM_MODEL
+    low = LLM_MODEL.lower()
+    ci = [i for i in ids if i.lower() == low]
+    if ci:
+        picked = ci[0]
+    else:
+        suffix = sorted({i for i in ids
+                         if i.lower() == low or i.lower().endswith("/" + low)})
+        picked = suffix[0] if len(suffix) == 1 else None
+    if picked:
+        print(f"bot: model {LLM_MODEL!r} -> {picked!r} (endpoint's id)", flush=True)
+        return picked
+    near = [i for i in ids if low.split("/")[-1] in i.lower()][:5]
+    print(f"bot: model {LLM_MODEL!r} not listed by endpoint; using as-is"
+          + (f" -- did you mean: {', '.join(near)}?" if near else ""), flush=True)
+    return LLM_MODEL
+
+
+def ask_llm(observation, memory):
+    msgs = [{"role": "system", "content": SYSTEM}]
+    for prev in memory[-5:]:
+        msgs.append({"role": "assistant", "content": json.dumps(prev)})
+    msgs.append({"role": "user", "content": observation})
+    payload = json.dumps({"model": LLM_MODEL, "messages": msgs,
+                          "temperature": 0.4, "stream": False}).encode()
+    body = http_json(f"{LLM_BASE_URL.rstrip('/')}/chat/completions", payload)
+    return extract_json(body["choices"][0]["message"]["content"] or "")
+
+
+# ------------------------------------------------------------ autonomy
+
+def build_program(act, dx, dy, rng):
+    """Follow-through between decisions: moves keep their heading, circle
+    lays a little trail of stamps, square gets a second swing."""
+    if act == "move" and (dx or dy):
+        return [("move", dx, dy)] * 6
+    if act == "circle":
+        step = ((dx, dy) if (dx or dy) else rng.choice(
+            [(-1, -1), (-1, 0), (-1, 1), (0, -1),
+             (0, 1), (1, -1), (1, 0), (1, 1)]))
+        prog = []
+        for _ in range(3):
+            prog += [("input", "circle", None), ("move", *step)]
+        prog.append(("input", "circle", None))
+        return prog
+    if act == "square":
+        return [("input", "square", None)]
+    return []
+
+
+def fallback_action(state, pid, rng, fb):
+    """Autopilot gardener: plants, flips modes and wanders with zero LLM,
+    so the world is always being played."""
+    now = time.time()
+    if now - fb.get("last_triangle", 0) > 45:
+        fb["last_triangle"] = now
+        return {"action": "triangle", "why": "fallback: change of pace"}
+    r = rng.random()
+    if not state.get("is_running"):
+        if r < 0.35:
+            return {"action": "pattern", "idx": rng.randrange(len(ALL_PATTERNS)),
+                    "why": "fallback: pick a pattern"}
+        if r < 0.75:
+            return {"action": "circle", "why": "fallback: stamp"}
+    elif r < 0.08:
+        return {"action": "square", "why": "fallback: cull"}
+    return {"action": "move", "dx": rng.choice((-1, 0, 1)),
+            "dy": rng.choice((-1, 0, 1)), "why": "fallback wander"}
+
+
 # ------------------------------------------------------------ observation
 
-def observe(state, pid):
+def observe(state, pid, nudge=""):
     me = next((p for p in state.get("players", []) if p["pid"] == pid), None)
     if me is None:
         return None
@@ -224,8 +311,9 @@ def observe(state, pid):
         f"pos:({px},{py}) kill_r:{me.get('kill_radius')} "
         f"pattern:{me.get('pattern_name')}(idx {idx},{me.get('category')})\n"
         f"stars:{len(stars)} dead:{len(dead)} baddies:{len(bad)}"
-        f"{' STOPPED' if state.get('baddies_stopped') else ''}\n"
-        + "\n".join(rows))
+        f"{' STOPPED' if state.get('baddies_stopped') else ''}"
+        + (f"\nnudge: {nudge}" if nudge else "")
+        + "\n" + "\n".join(rows))
 
 
 def placeable_idx(me, step):
@@ -253,6 +341,8 @@ def safe_int(v, default=0):
 
 
 def play():
+    global LLM_MODEL
+    LLM_MODEL = resolve_model()
     rng = random.Random()
     memory = []
     while True:  # reconnect loop
@@ -277,6 +367,9 @@ def play():
             signal.signal(signal.SIGINT, on_term)
 
             next_decision = 0.0
+            program, next_step = collections.deque(), 0.0
+            fb = {"last_triangle": 0.0}
+            last_mode, mode_turns, since_stamp = None, 0, 0
             while not stop["flag"]:
                 for m in srv.poll():
                     if m.get("type") != "state":
@@ -287,31 +380,59 @@ def play():
                         state.update(m.get("delta", {}))
                 now = time.time()
                 if now < next_decision:
+                    # follow-through program: real travel and stamp trails
+                    # between (possibly slow) LLM decisions
+                    if program and now >= next_step:
+                        kind, a, b = program.popleft()
+                        if kind == "move":
+                            srv.send({"cmd": "input", "action": "move",
+                                      "dx": a, "dy": b})
+                        else:
+                            srv.send({"cmd": "input", "action": a})
+                        next_step = now + 0.35
                     time.sleep(0.05)
                     continue
 
-                obs = observe(state, pid)
+                running = bool(state.get("is_running"))
+                nudge = ""
+                if mode_turns >= 8:
+                    nudge = (f"you have been in {'run' if last_mode else 'setup'} "
+                             f"mode for {mode_turns} turns; consider triangle")
+                elif not last_mode and since_stamp >= 8:
+                    nudge = f"{since_stamp} turns without stamping; consider circle"
+                obs = observe(state, pid, nudge)
                 if obs is None:
                     continue
-                action = None
-                try:
-                    action = ask_llm(obs, memory)
-                except Exception as e:
+                # LLM call in a daemon thread: a SIGTERM mid-request must
+                # still detach promptly instead of hanging until timeout.
+                res = {}
+
+                def work():
+                    try:
+                        res["action"] = ask_llm(obs, memory)
+                    except Exception as e:
+                        res["error"] = e
+                th = threading.Thread(target=work, daemon=True)
+                th.start()
+                while th.is_alive() and not stop["flag"]:
+                    th.join(0.1)
+                if stop["flag"]:
+                    break
+                action = res.get("action")
+                if "error" in res:
+                    e = res["error"]
                     print(f"bot: LLM error ({type(e).__name__}: {e}); "
                           f"random step", flush=True)
                 if not isinstance(action, dict):
-                    action = {"action": "move",
-                              "dx": rng.choice((-1, 0, 1)),
-                              "dy": rng.choice((-1, 0, 1)),
-                              "why": "fallback wander"}
+                    action = fallback_action(state, pid, rng, fb)
 
                 act = str(action.get("action", "wait")).lower()
                 me = next((p for p in state.get("players", [])
                            if p["pid"] == pid), {})
+                dx, dy = clamp(action.get("dx")), clamp(action.get("dy"))
                 if act == "move":
                     srv.send({"cmd": "input", "action": "move",
-                              "dx": clamp(action.get("dx")),
-                              "dy": clamp(action.get("dy"))})
+                              "dx": dx, "dy": dy})
                 elif act in ("square", "x", "circle", "triangle"):
                     srv.send({"cmd": "input", "action": act})
                 elif act == "r3":
@@ -323,10 +444,15 @@ def play():
                 elif act == "seed":
                     srv.send({"cmd": "command", "do": "seed"})
                 memory.append({"action": act,
-                               **({"dx": clamp(action.get("dx")),
-                                   "dy": clamp(action.get("dy"))}
-                                  if act == "move" else {}),
+                               **({"dx": dx, "dy": dy} if act == "move" else {}),
                                "why": str(action.get("why", ""))[:80]})
+                program.clear()
+                program.extend(build_program(act, dx, dy, rng))
+                if running != last_mode:
+                    last_mode, mode_turns = running, 0
+                else:
+                    mode_turns += 1
+                since_stamp = 0 if act == "circle" else since_stamp + 1
                 next_decision = time.time() + BOT_TICK  # pace after acting
                 print(f"bot: {memory[-1]}", flush=True)
 
