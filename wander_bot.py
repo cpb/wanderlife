@@ -87,7 +87,12 @@ Rhythm: wander until you find open space; in setup mode pick a pattern and
 stamp a small garden (circle a few times); triangle into run mode and let
 it live; square to prune overgrowth; back to setup to plant again. Change
 modes when it makes sense -- don't camp in one mode all game. Use seed
-sparingly, and never stamp onto another player."""
+sparingly, and never stamp onto another player. Your choices carry
+momentum: a move keeps its heading for several cells and a circle lays a
+short trail of stamps spaced by the pattern's footprint, so each decision
+shapes the next few seconds. To spread several copies without overlap,
+move at least the pattern's footprint (its WxH, shown above) plus one
+between stamps."""
 
 
 # --------------------------------------------------------------- protocol
@@ -232,15 +237,28 @@ def ask_llm(observation, memory):
 
 # ------------------------------------------------------------ autonomy
 
-def build_program(act, dx, dy, rng):
-    """Follow-through between decisions: moves keep their heading, circle
-    lays a little trail of stamps, square gets a second swing."""
+def pattern_dims(name):
+    """(w, h) footprint of a gallery pattern; 1x1 if unknown."""
+    for n, offsets in ALL_PATTERNS:
+        if n == name:
+            xs = [o[0] for o in offsets]
+            ys = [o[1] for o in offsets]
+            return max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
+    return 1, 1
+
+
+def build_program(act, dx, dy, rng, dims=(1, 1)):
+    """Follow-through between decisions: moves keep their heading; circle
+    lays a trail of stamps spaced by the pattern's footprint so copies
+    land side by side instead of overlapping; square gets a second swing."""
     if act == "move" and (dx or dy):
         return [("move", dx, dy)] * 6
     if act == "circle":
-        step = ((dx, dy) if (dx or dy) else rng.choice(
+        ux, uy = ((dx, dy) if (dx or dy) else rng.choice(
             [(-1, -1), (-1, 0), (-1, 1), (0, -1),
              (0, 1), (1, -1), (1, 0), (1, 1)]))
+        gap = max(dims) + 1  # one cell of daylight between copies
+        step = (ux * gap, uy * gap)
         prog = []
         for _ in range(3):
             prog += [("input", "circle", None), ("move", *step)]
@@ -306,10 +324,11 @@ def observe(state, pid, nudge=""):
         idx = [n for n, _ in ALL_PATTERNS].index(me["pattern_name"])
     except ValueError:
         idx = -1
+    w, h = pattern_dims(me["pattern_name"])
     return (
         f"mode:{'run' if state.get('is_running') else 'setup'} "
         f"pos:({px},{py}) kill_r:{me.get('kill_radius')} "
-        f"pattern:{me.get('pattern_name')}(idx {idx},{me.get('category')})\n"
+        f"pattern:{me.get('pattern_name')}(idx {idx},{me.get('category')}) {w}x{h}\n"
         f"stars:{len(stars)} dead:{len(dead)} baddies:{len(bad)}"
         f"{' STOPPED' if state.get('baddies_stopped') else ''}"
         + (f"\nnudge: {nudge}" if nudge else "")
@@ -366,11 +385,8 @@ def play():
             signal.signal(signal.SIGTERM, on_term)
             signal.signal(signal.SIGINT, on_term)
 
-            next_decision = 0.0
-            program, next_step = collections.deque(), 0.0
-            fb = {"last_triangle": 0.0}
-            last_mode, mode_turns, since_stamp = None, 0, 0
-            while not stop["flag"]:
+            def absorb():
+                nonlocal state
                 for m in srv.poll():
                     if m.get("type") != "state":
                         continue
@@ -378,6 +394,13 @@ def play():
                         state = dict(m["state"])
                     else:
                         state.update(m.get("delta", {}))
+
+            next_decision = 0.0
+            program, next_step = collections.deque(), 0.0
+            fb = {"last_triangle": 0.0}
+            last_mode, mode_turns, since_stamp = None, 0, 0
+            while not stop["flag"]:
+                absorb()
                 now = time.time()
                 if now < next_decision:
                     # follow-through program: real travel and stamp trails
@@ -416,6 +439,8 @@ def play():
                 th.start()
                 while th.is_alive() and not stop["flag"]:
                     th.join(0.1)
+                    absorb()  # keep the socket drained while the model thinks;
+                            # the server drops clients whose buffer fills
                 if stop["flag"]:
                     break
                 action = res.get("action")
@@ -447,7 +472,8 @@ def play():
                                **({"dx": dx, "dy": dy} if act == "move" else {}),
                                "why": str(action.get("why", ""))[:80]})
                 program.clear()
-                program.extend(build_program(act, dx, dy, rng))
+                program.extend(build_program(
+                    act, dx, dy, rng, pattern_dims(me.get("pattern_name"))))
                 if running != last_mode:
                     last_mode, mode_turns = running, 0
                 else:
