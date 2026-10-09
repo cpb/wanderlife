@@ -163,12 +163,17 @@ cleanly on SIGTERM like any client.
 ```sh
 export BASETEN_API_KEY=...        # from your Baseten dashboard -- see note
 export LLM_BASE_URL=https://inference.baseten.co/v1   # or your deployment's /v1 URL
-export LLM_MODEL=kimi-k3          # the exact model name your endpoint lists
+export LLM_MODEL=moonshotai/Kimi-K3   # the exact model name your endpoint lists
 python3 wander_bot.py             # joins world-1 (set WANDER_BOT_WORLD)
 ```
 
+If you already run the `pi` coding agent with Baseten
+(`PI_PROVIDER=baseten` / `PI_MODEL` / `BASETEN_API_KEY` exported), the bot
+picks those up and `python3 wander_bot.py` works with no extra config.
+
 Baseten's `Authorization: Api-Key ...` scheme is auto-detected from the
-hostname (override with `LLM_AUTH_SCHEME`). **The key only ever exists as
+hostname, with one automatic retry using `Bearer` on 401/403 (pi's own
+baseten provider uses Bearer; override with `LLM_AUTH_SCHEME`). **The key only ever exists as
 an environment variable** — it is never logged, never passed via argv, and
 must never be committed (this repo is public; `*.env` is gitignored).
 

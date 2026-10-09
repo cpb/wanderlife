@@ -22,7 +22,7 @@ WorkingDirectory=__WANDER_HOME__
 Environment=PYTHONUNBUFFERED=1
 Environment=WANDER_BOT_WORLD=world-1
 Environment=LLM_BASE_URL=https://inference.baseten.co/v1
-Environment=LLM_MODEL=kimi-k3
+Environment=LLM_MODEL=moonshotai/Kimi-K3
 # optional overrides + the API key (see warning above):
 EnvironmentFile=-__WANDER_HOME__/wander-bot.env
 ExecStart=/usr/bin/python3 __WANDER_HOME__/wander_bot.py

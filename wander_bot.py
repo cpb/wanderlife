@@ -9,15 +9,16 @@ hosted Moonshot/Kimi API, etc.
 Config (env):
   WANDER_SOCKET_PATH  server socket      (default ~/wander_server.sock)
   WANDER_BOT_WORLD    world to join      (default world-1)
-  LLM_BASE_URL        OpenAI-compat base (default http://localhost:11434/v1;
-                      Baseten: https://inference.baseten.co/v1 or your
-                      dedicated deployment's /v1 URL)
-  LLM_MODEL           model name/tag     (default kimi-k3; use the exact
-                      name your endpoint lists, e.g. a Baseten model slug)
+  LLM_BASE_URL        OpenAI-compat base (default: if the pi coding-agent
+                      env is present -- PI_PROVIDER=baseten -- then
+                      https://inference.baseten.co/v1, else
+                      http://localhost:11434/v1)
+  LLM_MODEL           model name/tag     (default: $PI_MODEL, else kimi-k3)
   LLM_API_KEY         API token          (default: $BASETEN_API_KEY, else
                       "ollama" -- Ollama ignores it)
   LLM_AUTH_SCHEME     Authorization scheme (default: Api-Key for baseten.co,
-                      Bearer otherwise)
+                      Bearer otherwise; unless pinned, a 401/403 retries
+                      once with the other scheme)
   BOT_TICK            seconds between decisions (default 2.5)
 
 If the LLM call fails or returns garbage the bot takes a random step
@@ -35,6 +36,7 @@ import signal
 import socket
 import sys
 import time
+import urllib.error
 import urllib.request
 
 from wander_game import ALL_PATTERNS, PROTOCOL_VERSION
@@ -42,8 +44,11 @@ from wander_game import ALL_PATTERNS, PROTOCOL_VERSION
 SOCK = os.environ.get("WANDER_SOCKET_PATH",
                       os.path.expanduser("~/wander_server.sock"))
 WORLD = os.environ.get("WANDER_BOT_WORLD", "world-1")
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1")
-LLM_MODEL = os.environ.get("LLM_MODEL", "kimi-k3")
+_DEFAULT_BASE = ("https://inference.baseten.co/v1"
+                 if os.environ.get("PI_PROVIDER") == "baseten"
+                 else "http://localhost:11434/v1")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", _DEFAULT_BASE)
+LLM_MODEL = os.environ.get("LLM_MODEL") or os.environ.get("PI_MODEL") or "kimi-k3"
 LLM_API_KEY = (os.environ.get("LLM_API_KEY")
                or os.environ.get("BASETEN_API_KEY") or "ollama")
 BOT_TICK = float(os.environ.get("BOT_TICK", "2.5"))
@@ -155,15 +160,28 @@ def ask_llm(observation, memory):
     for prev in memory[-5:]:
         msgs.append({"role": "assistant", "content": json.dumps(prev)})
     msgs.append({"role": "user", "content": observation})
-    req = urllib.request.Request(
-        f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
-        data=json.dumps({"model": LLM_MODEL, "messages": msgs,
-                         "temperature": 0.4, "stream": False}).encode(),
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"{resolve_auth_scheme(LLM_BASE_URL)} {LLM_API_KEY}"})
-    with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
-        body = json.loads(r.read())
-    return extract_json(body["choices"][0]["message"]["content"] or "")
+    payload = json.dumps({"model": LLM_MODEL, "messages": msgs,
+                          "temperature": 0.4, "stream": False}).encode()
+    url = f"{LLM_BASE_URL.rstrip('/')}/chat/completions"
+    # Baseten documents Api-Key but also accepts Bearer (pi's baseten
+    # provider uses Bearer): unless the scheme was pinned explicitly,
+    # retry a 401/403 once with the other scheme.
+    schemes = [resolve_auth_scheme(LLM_BASE_URL)]
+    if not os.environ.get("LLM_AUTH_SCHEME"):
+        schemes.append("Bearer" if schemes[0] == "Api-Key" else "Api-Key")
+    for i, scheme in enumerate(schemes):
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"{scheme} {LLM_API_KEY}"})
+        try:
+            with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
+                body = json.loads(r.read())
+            return extract_json(body["choices"][0]["message"]["content"] or "")
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403) and i + 1 < len(schemes):
+                continue
+            raise
 
 
 # ------------------------------------------------------------ observation
