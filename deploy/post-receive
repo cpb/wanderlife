@@ -16,13 +16,21 @@ while read oldrev newrev refname; do
         echo "post-receive: now at $(git --git-dir="$GITDIR" log --oneline -1 main)"
 
         if git --git-dir="$GITDIR" diff --name-only "$oldrev" "$newrev" \
-                | grep -qE 'wander(_game|_server|_client)?\.py$'; then
+                | grep -qE 'wander(_game|_server|_client|_bot)?\.py$'; then
             echo "post-receive: game code changed, restarting wander service"
             if sudo -n "$SYSTEMCTL" restart wander 2>/dev/null; then
                 echo "post-receive: wander service restarted"
             else
                 echo "post-receive: WARNING could not restart wander;"
                 echo "post-receive: run 'sudo systemctl restart wander' manually"
+            fi
+            # the bot is optional: bounce it only if its unit is enabled
+            if "$SYSTEMCTL" is-enabled --quiet wander-bot 2>/dev/null; then
+                if sudo -n "$SYSTEMCTL" restart wander-bot 2>/dev/null; then
+                    echo "post-receive: wander-bot restarted"
+                else
+                    echo "post-receive: WARNING could not restart wander-bot"
+                fi
             fi
         fi
     fi

@@ -5,3 +5,4 @@ wander_save.json
 wander_worlds/
 *.sock
 wander-server.log
+*.env

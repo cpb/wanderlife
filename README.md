@@ -13,6 +13,7 @@ Conway's Game of Life playground for a PS3 controller, built with pygame
 | `wander_server.py` | headless game server: hosts persistent worlds over a UNIX socket |
 | `wander_client.py` | curses client: PS3 controller, keyboard and touchpad/mouse all work; opens at a world menu, plays attached worlds |
 | `wander.py` | standalone single-player build (no server needed; requires pygame) |
+| `wander_bot.py` | LLM-driven player (Kimi K3 via Baseten, Ollama, ...) — attaches like any client |
 | `wanderctl` | dev-machine launcher: start the server if needed and play, stop, optional launchd autostart |
 | `deploy/` | push-deploy provisioning: `setup-host.sh`, systemd/sudoers/launchd templates, `post-receive` hook |
 
@@ -147,6 +148,49 @@ Tuning knobs live at the top of `wander.py`: `KILL_RADIUS`, `MAX_KILL_RADIUS`,
 In run mode the Game of Life ticks and `@` participates as a living cell.
 
 Save files are written to `~/wander_save.json` on the Pi.
+
+## LLM bot (Kimi K3)
+
+`wander_bot.py` attaches to a world as a normal play client and lets an
+LLM drive its `@`: every `BOT_TICK` seconds it shows the model the 13×13
+neighborhood, reads back one JSON action (`move`/`square`/`x`/`circle`/
+`triangle`/`pattern`/`seed`/`wait`), and plays it. If the endpoint errors
+or rambles, the bot takes a random step and carries on; it detaches
+cleanly on SIGTERM like any client.
+
+### Baseten
+
+```sh
+export BASETEN_API_KEY=...        # from your Baseten dashboard -- see note
+export LLM_BASE_URL=https://inference.baseten.co/v1   # or your deployment's /v1 URL
+export LLM_MODEL=kimi-k3          # the exact model name your endpoint lists
+python3 wander_bot.py             # joins world-1 (set WANDER_BOT_WORLD)
+```
+
+Baseten's `Authorization: Api-Key ...` scheme is auto-detected from the
+hostname (override with `LLM_AUTH_SCHEME`). **The key only ever exists as
+an environment variable** — it is never logged, never passed via argv, and
+must never be committed (this repo is public; `*.env` is gitignored).
+
+Ollama works the same way, no key needed:
+
+```sh
+LLM_BASE_URL=http://localhost:11434/v1 LLM_MODEL=llama3.2 python3 wander_bot.py
+```
+
+### On the Pi
+
+```sh
+sed -e "s|__WANDER_USER__|$USER|g" -e "s|__WANDER_HOME__|$HOME|g" \
+    deploy/wander-bot.service.template | sudo tee /etc/systemd/system/wander-bot.service
+printf 'LLM_API_KEY=%s\n' "$BASETEN_API_KEY" > ~/wander-bot.env
+chmod 600 ~/wander-bot.env
+sudo systemctl daemon-reload && sudo systemctl enable --now wander-bot
+journalctl -u wander-bot -f
+```
+
+Once the unit is enabled, the `post-receive` deploy hook restarts
+`wander-bot` alongside `wander` whenever bot/game code changes.
 
 ## Development
 

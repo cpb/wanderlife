@@ -1,0 +1,33 @@
+# systemd unit for the wander LLM bot (Kimi K3 via Baseten, Ollama, ...).
+# Installed by hand (not by setup-host.sh -- you must choose an endpoint):
+#   sed -e "s|__WANDER_USER__|$USER|g" -e "s|__WANDER_HOME__|$HOME|g" \
+#       deploy/wander-bot.service.template | sudo tee /etc/systemd/system/wander-bot.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now wander-bot
+#
+# SECRETS: never put LLM_API_KEY in this file -- it is version-controlled
+# and the repo is PUBLIC. Put it in __WANDER_HOME__/wander-bot.env instead
+# (untracked, chmod 600):
+#   printf 'LLM_API_KEY=%s\n' "$BASETEN_API_KEY" > ~/wander-bot.env
+#   chmod 600 ~/wander-bot.env
+[Unit]
+Description=Wander LLM bot (Kimi K3)
+After=wander.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__WANDER_USER__
+Group=__WANDER_USER__
+WorkingDirectory=__WANDER_HOME__
+Environment=PYTHONUNBUFFERED=1
+Environment=WANDER_BOT_WORLD=world-1
+Environment=LLM_BASE_URL=https://inference.baseten.co/v1
+Environment=LLM_MODEL=kimi-k3
+# optional overrides + the API key (see warning above):
+EnvironmentFile=-__WANDER_HOME__/wander-bot.env
+ExecStart=/usr/bin/python3 __WANDER_HOME__/wander_bot.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
